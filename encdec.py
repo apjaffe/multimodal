@@ -59,6 +59,32 @@ class EncoderDecoder:
     self.params = [self.src_lookup, self.dec_builder, self.W_y, self.b_y]
     #self.dec_builder.set_dropout(float(dropout))
  
+  def make_caption(self, img, max_len = 50):
+    dy.renew_cg()
+    W_y = dy.parameter(self.W_y)
+    b_y = dy.parameter(self.b_y)
+    img_vec = dy.inputVector(img)
+
+    trans_sentence = ['<S>']
+    cw = trans_sentence[0]
+    dec_state = self.dec_builder.initial_state([img_vec])
+    while len(trans_sentence) < max_len:
+        embed_t = dy.lookup(self.src_lookup, self.src_token_to_id[cw])
+        dec_state = dec_state.add_input(embed_t)
+        y_star =  W_y*dec_state.output() + b_y
+        # Get probability distribution for the next word to be generated
+        p = dy.softmax(y_star)
+        p_val = p.npvalue() #vec_value
+        amax = np.argmax(p_val)
+
+        # Find the word corresponding to the best id
+        cw = self.src_id_to_token[amax]
+        if cw == '</S>':
+            break
+        trans_sentence.append(cw)
+
+    return ' '.join(trans_sentence[1:])
+
   def step_batch(self, batch, cnum):
     dy.renew_cg()
     W_y = dy.parameter(self.W_y)
@@ -190,6 +216,8 @@ def main():
           trainer.update()
         
         if tidx % 100 == 0:
+          print(encdec.make_caption(valid_imgs[0]))
+          print(encdec.make_caption(valid_imgs[1]))
           print("Batch %d for caption set %d with loss %f" % (tidx, cnum, partial_loss / partial_words))
           partial_loss = 0
           partial_words = 0
