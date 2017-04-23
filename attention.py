@@ -49,7 +49,7 @@ class Attention:
     print("Vocab size: %d" % self.src_vocab_size)
 
     if os.path.isfile(model_file):
-      self.src_lookup, self.dec_builder, self.W_y, self.b_y = model.load(model_file)
+      self.src_lookup, self.dec_builder, self.W_y, self.b_y, self.W1_att_img, self.W1_att_src, self.w2_att = model.load(model_file)
     else:
       self.src_lookup = model.add_lookup_parameters((self.src_vocab_size, self.embed_size))
       self.dec_builder = builder(self.layers, self.embed_size + self.image_size, self.hidden_size, model)
@@ -60,7 +60,7 @@ class Attention:
       self.w2_att = model.add_parameters((1,self.attention_size))
 
 
-    self.params = [self.src_lookup, self.dec_builder, self.W_y, self.b_y]
+    self.params = [self.src_lookup, self.dec_builder, self.W_y, self.b_y, self.W1_att_img, self.W1_att_src, self.w2_att]
     self.dec_builder.set_dropout(float(dropout))
  
   # Calculates the context vector using a MLP
@@ -98,7 +98,7 @@ class Attention:
     dec_state = self.dec_builder.initial_state().add_input(start)
     while len(trans_sentence) < max_len:
         h_e = dec_state.output()
-        c_t, a_t = self.__attention_mlp(img_vec, h_e, w1)
+        c_t, a_t = self.__attention_mlp(h_fs_matrix, h_e, w1)
 
         embed_t = dy.lookup(self.src_lookup, self.src_token_to_id[cw])
         x_t = dy.concatenate([embed_t, c_t])
@@ -145,14 +145,13 @@ class Attention:
       src_cws.append(row)
       masks.append(dy.reshape(dy.inputVector(mask), (1,), batch_size = num_batches))
     img_vec = dy.inputTensor([x[0] for x in batch], batched = True)
-    h_fs_matrix = dy.transpose(img_vec)
-    c_t = dy.vecInput(2*self.hidden_size)
+    h_fs_matrix = dy.transpose(img_vec) #image_size * image_points 
+    c_t = dy.vecInput(self.image_size)
     start_tokens = ["<S>"] * num_batches
     start_ids = [self.src_token_to_id[st] for st in start_tokens] 
     start = dy.concatenate([dy.lookup_batch(self.src_lookup, start_ids), c_t]) 
     dec_state = self.dec_builder.initial_state().add_input(start)
     w1 = W1_att_img * h_fs_matrix
-    
     for i, (cws, nws, mask) in enumerate(zip(src_cws, src_cws[1:], masks)):
         h_e = dec_state.output()
         c_t, a_t = self.__attention_mlp(h_fs_matrix, h_e, w1)
@@ -212,6 +211,8 @@ def main():
   parser.add_argument('--image_points', default = 196) #fixed
   parser.add_argument('--dynet-mem')
   parser.add_argument('--dynet-gpu', action='store_true')
+  parser.add_argument('--eval', nargs='*')
+  parser.add_argument('--output', default='out')
   args = parser.parse_args()
 
   if os.path.isfile(args.captions_src):
@@ -235,9 +236,25 @@ def main():
   model = dy.Model()
   trainer = dy.AdamTrainer(model)
   encdec = Attention(model, train_imgs, captions_train_src, args.model_file, args.token_file, args.vocab_freq, args.embed_size, args.hidden_size, args.image_size, args.image_points, args.attention_size, args.dropout, builder)
+  
+  if args.eval and len(args.eval) > 0:
+    for idx, eval_file in enumerate(args.eval):
+      with open(eval_file+"."+args.output + ".txt","w") as f:
+        test_imgs = get_imgs(eval_file)
+        for img in test_imgs:
+          sent = encdec.make_caption(img)
+          print(sent)
+          f.write(sent.encode("utf-8")+"\n")
+    return
+  
   batches = []
   for cnum in xrange(args.num_captions):
-    batches.append(mt_util.make_batches(encdec.training, int(args.batch_size), cnum, 3))
+    cbatches = mt_util.make_batches(encdec.training, int(args.batch_size), cnum, 3)
+    print(len(cbatches))
+    for cbatch in cbatches:
+      batches.append((cbatch,cnum))
+
+  print("Batches: %d" % len(batches))
 
   num_epochs = 100
   cnums = list(xrange(args.num_captions))
@@ -245,10 +262,12 @@ def main():
   for eidx, epoch in enumerate(range(num_epochs)):
     train_loss, train_words = 0, 0
     partial_loss, partial_words = 0, 0
-    random.shuffle(cnums)
-    for cnum in cnums:
-      random.shuffle(batches[cnum])
-      for tidx, batch in enumerate(batches[cnum]):
+    random.shuffle(batches)
+    #random.shuffle(cnums)
+    #for cnum in cnums:
+    #  random.shuffle(batches[cnum])
+    for tidx, (batch, cnum) in enumerate(batches):
+      #for tidx, batch in enumerate(batches[cnum]):
         loss, words = encdec.step_batch(batch, cnum)
 
         if loss is not None:
@@ -263,7 +282,7 @@ def main():
         if tidx % 100 == 0:
           print(encdec.make_caption(valid_imgs[0]))
           print(encdec.make_caption(valid_imgs[1]))
-          print("Batch %d for caption set %d with loss %f" % (tidx, cnum, partial_loss / partial_words))
+          print("Batch %d with loss %f" % (tidx, partial_loss / partial_words))
           partial_loss = 0
           partial_words = 0
 
