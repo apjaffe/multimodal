@@ -110,9 +110,14 @@ class EncoderDecoder:
           mask.append(0)
       src_cws.append(row)
       masks.append(dy.reshape(dy.inputVector(mask), (1,), batch_size = num_batches))
-
+    #print(batch[0])
+    #print(len(batch))
     img_batch = [dy.inputVector(x[0]) for x in batch]
-    img_vec = dy.reshape(dy.concatenate(img_batch), (self.hidden_size,), batch_size = num_batches)
+    #print(batch[0][0])
+    concat = dy.concatenate_cols(img_batch)
+    #print(concat.npvalue().shape)
+    #print(concat.npvalue())
+    img_vec = dy.reshape(concat, (self.hidden_size,), batch_size = num_batches)
     #img_state = dy.inputVector(img_batch)#dy.reshape(dy.inputVector(img_batch), (self.hidden_size,), batch_size = num_batches)
     dec_state = self.dec_builder.initial_state([img_vec])
     
@@ -166,7 +171,7 @@ def main():
   parser.add_argument('--lstm', action='store_true')
   #parser.add_argument('--image_size', default = 2048) #fixed
   parser.add_argument('--dynet-mem')
-  parser.add_argument('--dynet-gpu')
+  parser.add_argument('--dynet-gpu', action='store_true')
   args = parser.parse_args()
 
   if os.path.isfile(args.captions_src):
@@ -192,7 +197,7 @@ def main():
   encdec = EncoderDecoder(model, train_imgs, captions_train_src, args.model_file, args.token_file, args.vocab_freq, args.embed_size, args.hidden_size, args.dropout, builder)
   batches = []
   for cnum in xrange(args.num_captions):
-    batches.append(mt_util.make_batches(encdec.training, args.batch_size, cnum, 3))
+    batches.append(mt_util.make_batches(encdec.training, int(args.batch_size), cnum, 3))
 
   num_epochs = 100
   cnums = list(xrange(args.num_captions))
