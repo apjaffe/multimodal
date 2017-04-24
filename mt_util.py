@@ -42,19 +42,18 @@ def clean(wd):
   return wd.decode("utf-8").encode("ascii","ignore")
     
 def make_batches(training, batch_size, cnum, min_len = 3):
-  filtered = filter(lambda x: len(x[1]) >= min_len, training)
-
+  filtered = filter(lambda x: len(x[1][cnum]) >= min_len, training)
   filtered.sort(key=lambda x: -len(x[1][cnum]))
   batches = []
   current_batch = []
   batch_len = None
   for pair in filtered:
     if batch_len is None:
-      batch_len = len(pair[0])
+      batch_len = len(pair[1][cnum])
       current_batch = [pair]
-    elif len(pair[0]) != batch_len or len(current_batch) == batch_size:
+    elif len(pair[1][cnum]) != batch_len or len(current_batch) == batch_size:
       batches.append(current_batch)
-      batch_len = len(pair[0])
+      batch_len = len(pair[1][cnum])
       current_batch = [pair]
     else:
       current_batch.append(pair)
