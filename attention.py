@@ -181,7 +181,7 @@ def dev_perplexity(dev_batches, encdec, num_captions):
           lv = loss.value()
           dev_loss += lv
           dev_words += words
-        if tidx >= 1:
+        if tidx >= 3:
           print("Dev cnum %d" % cnum)
           break
 
@@ -196,7 +196,7 @@ def main():
   parser.add_argument('--train_img', default='flickr30k_ResNets50_blck4_train.fp16.npy')
   parser.add_argument('--valid_src', default='mmt_task2/en/val/val.')
   parser.add_argument('--valid_tgt', default='mmt_task2/de/val/de_val.')
-  parser.add_argument('--valid_img', default='task2_ResNet50_res4fx_test2017.fp16.npy')
+  parser.add_argument('--valid_img', default='flickr30k_ResNets50_blck4_val.fp16.npy')
   parser.add_argument('--batch_size',default=16)
   parser.add_argument('--min_freq',default=10)
   parser.add_argument('--model_file', default = "encdec1.mdl")
@@ -239,7 +239,7 @@ def main():
   
   if args.eval and len(args.eval) > 0:
     for idx, eval_file in enumerate(args.eval):
-      with open(eval_file+"."+args.output + ".txt","w") as f:
+      with open("output/"+eval_file+"."+args.output + ".txt","w") as f:
         test_imgs = get_imgs(eval_file)
         for img in test_imgs:
           sent = encdec.make_caption(img)
@@ -295,6 +295,10 @@ def main():
       min_perp = dev_perp
       print("start saving")
       model.save(args.model_file,encdec.params)
+      print("done saving")
+    else:
+      print("start saving overfit")
+      model.save("of."+args.model_file,encdec.params)
       print("done saving")
     trainer.update_epoch(1.0)
   

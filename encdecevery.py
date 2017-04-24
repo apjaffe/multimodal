@@ -175,6 +175,8 @@ def main():
   parser.add_argument('--image_size', default = 2048) #fixed
   parser.add_argument('--dynet-mem')
   parser.add_argument('--dynet-gpu', action='store_true')
+  parser.add_argument('--eval', nargs='*')
+  parser.add_argument('--output', default='out')
   args = parser.parse_args()
 
   if os.path.isfile(args.captions_src):
@@ -198,6 +200,18 @@ def main():
   model = dy.Model()
   trainer = dy.AdamTrainer(model)
   encdec = EncoderDecoder(model, train_imgs, captions_train_src, args.model_file, args.token_file, args.vocab_freq, args.embed_size, args.hidden_size, args.image_size, args.dropout, builder)
+  
+  
+  if args.eval and len(args.eval) > 0:
+    for idx, eval_file in enumerate(args.eval):
+      with open("output/"+eval_file+"."+args.output + ".txt","w") as f:
+        test_imgs = get_imgs(eval_file)
+        for img in test_imgs:
+          sent = encdec.make_caption(img)
+          print(sent)
+          f.write(sent.encode("utf-8")+"\n")
+    return
+  
   batches = []
   for cnum in xrange(args.num_captions):
     batches.append(mt_util.make_batches(encdec.training, int(args.batch_size), cnum, 3))
@@ -240,6 +254,11 @@ def main():
       print("start saving")
       model.save(args.model_file,encdec.params)
       print("done saving")
+    else:
+      print("start saving overfit")
+      model.save("of."+args.model_file,encdec.params)
+      print("done saving")
+
     trainer.update_epoch(1.0)
   
 
