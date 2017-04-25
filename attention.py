@@ -82,7 +82,7 @@ class Attention:
       c_t = h_fs_matrix * alignment
       return c_t, alignment # image_size x 1, image_points x 1
 
-  def make_caption(self, img, max_len = 50):
+  def make_caption(self, img, max_len = 50, show_attention = False):
     dy.renew_cg()
     W_y = dy.parameter(self.W_y)
     b_y = dy.parameter(self.b_y)
@@ -96,9 +96,12 @@ class Attention:
     c_t = dy.vecInput(self.image_size)
     start = dy.concatenate([dy.lookup(self.src_lookup, self.src_token_to_id['<S>']), c_t])
     dec_state = self.dec_builder.initial_state().add_input(start)
+    att = []
     while len(trans_sentence) < max_len:
         h_e = dec_state.output()
         c_t, a_t = self.__attention_mlp(h_fs_matrix, h_e, w1)
+        if show_attention:
+          att.append(a_t.value().tolist())
 
         embed_t = dy.lookup(self.src_lookup, self.src_token_to_id[cw])
         x_t = dy.concatenate([embed_t, c_t])
@@ -116,7 +119,8 @@ class Attention:
             break
         trans_sentence.append(cw)
 
-    return ' '.join(trans_sentence[1:])
+    sent = ' '.join(trans_sentence[1:])
+    return sent, att
 
   def step_batch(self, batch, cnum):
     dy.renew_cg()
@@ -213,6 +217,7 @@ def main():
   parser.add_argument('--dynet-gpu', action='store_true')
   parser.add_argument('--eval', nargs='*')
   parser.add_argument('--output', default='out')
+  parser.add_argument('--show_attention', action='store_true')
   args = parser.parse_args()
 
   if os.path.isfile(args.captions_src):
@@ -239,12 +244,15 @@ def main():
   
   if args.eval and len(args.eval) > 0:
     for idx, eval_file in enumerate(args.eval):
-      with open("output/"+eval_file+"."+args.output + ".txt","w") as f:
-        test_imgs = get_imgs(eval_file)
-        for img in test_imgs:
-          sent = encdec.make_caption(img)
-          print(sent)
-          f.write(sent.encode("utf-8")+"\n")
+      with open("attout/"+eval_file+"."+args.output + ".txt","w") as fa:
+        with open("output/"+eval_file+"."+args.output + ".txt","w") as f:
+          test_imgs = get_imgs(eval_file)
+          for img in test_imgs:
+            sent, att = encdec.make_caption(img, show_attention = args.show_attention)
+            print(sent)
+            if(args.show_attention):
+              fa.write(json.dumps(att)+"\n")
+            f.write(sent.encode("utf-8")+"\n")
     return
   
   batches = []
@@ -280,8 +288,8 @@ def main():
           trainer.update()
         
         if tidx % 100 == 0:
-          print(encdec.make_caption(valid_imgs[0]))
-          print(encdec.make_caption(valid_imgs[1]))
+          print(encdec.make_caption(valid_imgs[0])[0])
+          print(encdec.make_caption(valid_imgs[1])[0])
           print("Batch %d with loss %f" % (tidx, partial_loss / partial_words))
           partial_loss = 0
           partial_words = 0
