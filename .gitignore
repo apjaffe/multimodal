@@ -1,1 +1,7 @@
 *.pyc
+*.mdl
+*.mdl.pyk
+*.mdl.pym
+*.npy
+*.mat
+*.zip
