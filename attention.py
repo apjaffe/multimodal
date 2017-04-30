@@ -10,6 +10,9 @@ import mt_util
 import math
 import heapq
 
+ENCDECPIPELINE="encdecpipeline"
+FORK="fork"
+
 def get_imgs(fname):
   return np.load(fname)
 
@@ -30,7 +33,7 @@ def rnn_builder(layer_depth, emb_size, hidden_size, model):
   return dy.SimpleRNNBuilder(layer_depth, emb_size, hidden_size, model)
 
 class Attention:
-  def __init__(self, model, imgs, captions_src, captions_tgt, model_file, token_file, min_freq, embed_size, hidden_size, image_size, image_points, attention_size, dropout, builder, multilang):
+  def __init__(self, model, imgs, captions_src, captions_tgt, model_file, token_file, min_freq, embed_size, hidden_size, image_size, image_points, attention_size, dropout, builder, multilang, multilangmode):
     self.model = model
     self.src_freqs = mt_util.word_freqs(captions_src)
     self.tgt_freqs = mt_util.word_freqs(captions_tgt)
@@ -42,6 +45,7 @@ class Attention:
     self.attention_size = int(attention_size)
     self.layers = 1
     self.multilang = multilang
+    self.multilangmode = multilangmode
     if os.path.isfile("src"+token_file):
       self.src_token_to_id = mt_util.defaultify(json.load(open("src"+token_file)))
       self.src_id_to_token = mt_util.invert_ids(self.src_token_to_id)
@@ -58,7 +62,10 @@ class Attention:
 
     if os.path.isfile(model_file):
       if multilang:
-        self.src_lookup, self.dec_builder, self.W_y, self.b_y, self.W1_att_img, self.W1_att_src, self.w2_att, self.tgt_lookup, self.W_tgt, self.b_tgt = model.load(model_file)
+        if multilangmode == FORK:
+          self.src_lookup, self.dec_builder, self.W_y, self.b_y, self.W1_att_img, self.W1_att_src, self.w2_att, self.tgt_lookup, self.W_tgt, self.b_tgt = model.load(model_file)
+        elif multilangmode == ENCDECPIPELINE:
+           self.src_lookup, self.dec_builder, self.W_y, self.b_y, self.W1_att_img, self.W1_att_src, self.w2_att, self.tgt_lookup, self.W_tgt, self.b_tgt, self.tgt_enc_builder, self.tgt_dec_builder = model.load(model_file)
       else:
         self.src_lookup, self.dec_builder, self.W_y, self.b_y, self.W1_att_img, self.W1_att_src, self.w2_att = model.load(model_file)
     else:
@@ -73,11 +80,16 @@ class Attention:
         self.tgt_lookup = model.add_lookup_parameters((self.tgt_vocab_size, self.embed_size))
         self.W_tgt = model.add_parameters((self.tgt_vocab_size, self.hidden_size))
         self.b_tgt = model.add_parameters((self.tgt_vocab_size))
-
+      if multilangmode == ENCDECPIPELINE:
+        self.tgt_enc_builder = builder(self.layers, self.embed_size, self.hidden_size, model)
+        self.tgt_dec_builder = builder(self.layers, self.embed_size, self.hidden_size, model)
 
     self.params = [self.src_lookup, self.dec_builder, self.W_y, self.b_y, self.W1_att_img, self.W1_att_src, self.w2_att]
     if multilang:
       self.params += [self.tgt_lookup, self.W_tgt, self.b_tgt]
+    if multilangmode == ENCDECPIPELINE:
+      self.params += [self.tgt_enc_builder, self.tgt_dec_builder]
+      
     self.dec_builder.set_dropout(float(dropout))
  
   # Calculates the context vector using a MLP
@@ -235,6 +247,7 @@ class Attention:
     start = dy.concatenate([dy.lookup_batch(src_lookup, start_ids), c_t]) 
     dec_state = self.dec_builder.initial_state().add_input(start)
     w1 = W1_att_img * h_fs_matrix
+    avg_embeds = list()
     for i, (cws, nws, mask) in enumerate(zip(src_cws, src_cws[1:], masks)):
         h_e = dec_state.output()
         c_t, a_t = self.__attention_mlp(h_fs_matrix, h_e, w1)
@@ -245,12 +258,17 @@ class Attention:
         x_t = dy.concatenate([embed_t, c_t])
         dec_state = dec_state.add_input(x_t)
 
-        y_star =  W_y*dec_state.output() + b_y
+        y_star =  W_y*dec_state.output() + b_y #y_star is src_vocab_size * 1
+
+        #HERE
+        p = dy.softmax(y_star)
+        avg_embeds.append(dy.transpose(src_lookup) * p)
+        
         nwids = [src_token_to_id[nw] for nw in nws]
         loss = dy.pickneglogsoftmax_batch(y_star, nwids)
         mask_loss = dy.cmult(loss, mask)
         losses.append(mask_loss)
-    return losses, total_words
+    return losses, total_words, avg_embeds
 
   def step_batch(self, batch, cnum):
     dy.renew_cg()
@@ -259,12 +277,15 @@ class Attention:
     src_batch = [["<S>"]+x[1][cnum]+["</S>"] for x in batch]
     tgt_batch = [["<S>"]+x[2][cnum]+["</S>"] for x in batch]
 
-    losses, total_words = self.compute_losses(batch, src_batch, self.src_lookup, self.src_token_to_id, W_y, b_y)
+    losses, total_words, avg_embeds = self.compute_losses(batch, src_batch, self.src_lookup, self.src_token_to_id, W_y, b_y)
 
     if self.multilang:
       W_tgt = dy.parameter(self.W_tgt)
       b_tgt = dy.parameter(self.b_tgt)
-      losses_tgt, total_words_tgt = self.compute_losses(batch, tgt_batch, self.tgt_lookup, self.tgt_token_to_id, W_tgt, b_tgt)
+      if self.multilang_mode == FORK:
+        losses_tgt, total_words_tgt, avg_embeds_tgt = self.compute_losses(batch, tgt_batch, self.tgt_lookup, self.tgt_token_to_id, W_tgt, b_tgt)
+      else:
+        pass #TODO
       losses += losses_tgt
       total_words += total_words_tgt
 
@@ -316,6 +337,11 @@ def main():
   parser.add_argument('--output', default='out')
   parser.add_argument('--show_attention', action='store_true')
   parser.add_argument('--multilang', action='store_true')
+  
+  parser.add_argument('--multilangmode', default=FORK)
+    # fork: one decoder, separate word embeddings
+    # encdecpipeline: output of src used to generate tgt (enc-dec)
+  
   parser.add_argument('--beam_size', default = 1)
   args = parser.parse_args()
 
@@ -354,7 +380,7 @@ def main():
 
   model = dy.Model()
   trainer = dy.AdamTrainer(model)
-  encdec = Attention(model, train_imgs, captions_train_src, captions_train_tgt, args.model_file, args.token_file, args.vocab_freq, args.embed_size, args.hidden_size, args.image_size, args.image_points, args.attention_size, args.dropout, builder, args.multilang)
+  encdec = Attention(model, train_imgs, captions_train_src, captions_train_tgt, args.model_file, args.token_file, args.vocab_freq, args.embed_size, args.hidden_size, args.image_size, args.image_points, args.attention_size, args.dropout, builder, args.multilang, args.multilangmode)
   
   if args.eval and len(args.eval) > 0:
     for idx, eval_file in enumerate(args.eval):
