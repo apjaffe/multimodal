@@ -7,3 +7,7 @@ splits/
 *.gz
 *.zip
 *.mat
+*.pyc
+*.mdl
+*.mdl.pyk
+*.mdl.pym
