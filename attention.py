@@ -1,5 +1,4 @@
 import numpy as np
-import h5py
 from nltk.tokenize import word_tokenize
 import argparse
 import json
@@ -212,11 +211,58 @@ class Attention:
       W_y = dy.parameter(self.W_y)
       b_y = dy.parameter(self.b_y)
       return self.do_make_beam_caption(img, self.src_lookup, self.src_token_to_id,  self.src_id_to_token, self.src_vocab_size, W_y, b_y, max_len, show_attention, beam_size)
-    else:
+    elif self.multilangmode == FORK:
       W_tgt = dy.parameter(self.W_tgt)
       b_tgt = dy.parameter(self.b_tgt)
       return self.do_make_beam_caption(img, self.tgt_lookup, self.tgt_token_to_id,  self.tgt_id_to_token, self.tgt_vocab_size, W_tgt, b_tgt, max_len, show_attention, beam_size)
+    else:
+      return "multilang mode %s not implemented" % self.multilangmode, []
+
+  def encdec_losses(self, avg_embeds, tgt_batch, tgt_lookup, tgt_token_to_id, W_tgt, b_tgt, tgt_enc_builder, tgt_dec_builder):
+# note issues with avg_embed having different lengths between different sentences in batch
+    enc_state = tgt_enc_builder.initial_state()
+    for embed in avg_embeds:
+      enc_state = enc_state.add_input(embed)
+   
+    encoded = enc_state.output()
     
+    losses = []
+    total_words = 0
+    tgt_cws = []
+    masks = []
+    tgt_len = [len(sent) for sent in tgt_atch]
+    max_len_tgt = max(tgt_len)
+    total_words = sum(tgt_len)
+    num_batches = len(tgt_batch)
+    for c in xrange(max_len_tgt):
+      row = []
+      mask = []
+      for r in xrange(len(tgt_batch)):
+        if c < len(tgt_batch[r]):
+          row.append(tgt_batch[r][c])
+          mask.append(1)
+        else:
+          row.append("</S>")
+          mask.append(0)
+      tgt_cws.append(row)
+      masks.append(dy.reshape(dy.inputVector(mask), (1,), batch_size = num_batches))
+    
+    dec_state = tgt_dec_builder.initial_state([encoded])
+
+
+    for i, (cws, nws, mask) in enumerate(zip(tgt_cws, tgt_cws[1:], masks)):
+        cwids = [tgt_token_to_id[cw] for cw in cws] 
+        embed_t = dy.lookup_batch(tgt_lookup, cwids)
+        dec_state = dec_state.add_input(embed_t)
+        
+        nwids = [tgt_token_to_id[nw] for nw in nws]
+        y_star =  W_tgt*dec_state.output() + b_tgt
+        loss = dy.pickneglogsoftmax_batch(y_star, nwids)
+        mask_loss = dy.cmult(loss, mask)
+        losses.append(mask_loss)
+
+    return (dy.sum_batches(dy.esum(losses))), total_words
+
   def compute_losses(self, batch, src_batch, src_lookup, src_token_to_id, W_y, b_y):
     W1_att_img = dy.parameter(self.W1_att_img) # attention_size * image_size
     losses = []
@@ -284,8 +330,10 @@ class Attention:
       b_tgt = dy.parameter(self.b_tgt)
       if self.multilang_mode == FORK:
         losses_tgt, total_words_tgt, avg_embeds_tgt = self.compute_losses(batch, tgt_batch, self.tgt_lookup, self.tgt_token_to_id, W_tgt, b_tgt)
-      else:
-        pass #TODO
+      elif self.multilang_mode == ENCDECPIPELINE:
+        tgt_enc_builder = self.tgt_enc_builder
+        tgt_dec_builder = self.tgt_dec_builder
+        losses_tgt, total_words_tgt = self.encdec_losses(avg_embeds, tgt_batch, self.tgt_lookup, self.tgt_token_to_id, W_tgt, b_tgt, tgt_enc_builder, tgt_dec_builder)
       losses += losses_tgt
       total_words += total_words_tgt
 
