@@ -32,7 +32,7 @@ def rnn_builder(layer_depth, emb_size, hidden_size, model):
   return dy.SimpleRNNBuilder(layer_depth, emb_size, hidden_size, model)
 
 class Attention:
-  def __init__(self, model, imgs, captions_src, captions_tgt, model_file, token_file, min_freq, embed_size, hidden_size, image_size, image_points, attention_size, dropout, builder, multilang, multilangmode):
+  def __init__(self, model, imgs, captions_src, captions_tgt, model_file, token_file, min_freq, embed_size, hidden_size, image_size, image_points, attention_size, dropout, builder, multilang, multilangmode, pipeline_candidates):
     self.model = model
     self.src_freqs = mt_util.word_freqs(captions_src)
     self.tgt_freqs = mt_util.word_freqs(captions_tgt)
@@ -82,6 +82,7 @@ class Attention:
       if multilangmode == ENCDECPIPELINE:
         self.tgt_enc_builder = builder(self.layers, self.embed_size, self.hidden_size, model)
         self.tgt_dec_builder = builder(self.layers, self.embed_size, self.hidden_size, model)
+        self.pipeline_candidates = int(pipeline_candidates)
 
     self.params = [self.src_lookup, self.dec_builder, self.W_y, self.b_y, self.W1_att_img, self.W1_att_src, self.w2_att]
     if multilang:
@@ -110,7 +111,7 @@ class Attention:
       c_t = h_fs_matrix * alignment
       return c_t, alignment # image_size x 1, image_points x 1
   
-  def do_make_beam_caption(self, img, src_lookup, src_token_to_id, src_id_to_token, src_vocab_size, W_y, b_y, max_len, show_attention, beam_size):
+  def do_make_beam_caption(self, img, src_lookup, src_token_to_id, src_id_to_token, src_vocab_size, W_y, b_y, max_len, show_attention, beam_size, show_candidates):
     if beam_size == 1:
       return self.do_make_caption(img, src_lookup, src_token_to_id, src_id_to_token, W_y, b_y, max_len, show_attention)
 
@@ -164,7 +165,14 @@ class Attention:
       position += 1
 
     #print(list([cand[0] for cand in candidates]))
-    return " ".join(candidates[0][0][1:-1]), []
+    if show_candidates:
+      out = ""
+      for cand in candidates:
+        out += " ".join(cand[0][1:-1]) + " | "
+      return out, [], []
+      
+
+    return " ".join(candidates[0][0][1:-1]), [], []
     #sent = ' '.join(trans_sentence[1:])
     #return sent
 
@@ -179,6 +187,7 @@ class Attention:
     start = dy.concatenate([dy.lookup(src_lookup, src_token_to_id['<S>']), c_t])
     dec_state = self.dec_builder.initial_state().add_input(start)
     att = []
+    embeds = []
     while len(trans_sentence) < max_len:
         h_e = dec_state.output()
         c_t, a_t = self.__attention_mlp(h_fs_matrix, h_e, w1)
@@ -195,6 +204,9 @@ class Attention:
         p_val = p.npvalue() #vec_value
         amax = np.argmax(p_val)
 
+        if self.multilangmode == ENCDECPIPELINE:
+          embeds.append(dy.lookup(src_lookup, amax) * dy.pick(p, amax))
+
         # Find the word corresponding to the best id
         cw = src_id_to_token[amax]
         if cw == '</S>':
@@ -202,21 +214,61 @@ class Attention:
         trans_sentence.append(cw)
 
     sent = ' '.join(trans_sentence[1:])
-    return sent, att
+    return sent, att, embeds
 
-  def make_caption(self, img, max_len = 30, show_attention = False, is_src = True, beam_size = 1):
+  def make_caption(self, img, max_len = 30, show_attention = False, is_src = True, beam_size = 1, show_candidates = False):
     dy.renew_cg()
 
     if is_src:
       W_y = dy.parameter(self.W_y)
       b_y = dy.parameter(self.b_y)
-      return self.do_make_beam_caption(img, self.src_lookup, self.src_token_to_id,  self.src_id_to_token, self.src_vocab_size, W_y, b_y, max_len, show_attention, beam_size)
+      sent, att, emb = self.do_make_beam_caption(img, self.src_lookup, self.src_token_to_id,  self.src_id_to_token, self.src_vocab_size, W_y, b_y, max_len, show_attention, beam_size, show_candidates)
+      return sent, att
     elif self.multilangmode == FORK:
       W_tgt = dy.parameter(self.W_tgt)
       b_tgt = dy.parameter(self.b_tgt)
-      return self.do_make_beam_caption(img, self.tgt_lookup, self.tgt_token_to_id,  self.tgt_id_to_token, self.tgt_vocab_size, W_tgt, b_tgt, max_len, show_attention, beam_size)
-    else:
-      return "multilang mode %s not implemented" % self.multilangmode, []
+      sent, att, emb = self.do_make_beam_caption(img, self.tgt_lookup, self.tgt_token_to_id,  self.tgt_id_to_token, self.tgt_vocab_size, W_tgt, b_tgt, max_len, show_attention, beam_size, show_candidates)
+      return sent, att
+    elif self.multilangmode == ENCDECPIPELINE: # beam size must be 1
+      W_y = dy.parameter(self.W_y)
+      b_y = dy.parameter(self.b_y)
+      sent, att, emb = self.do_make_beam_caption(img, self.src_lookup, self.src_token_to_id,  self.src_id_to_token, self.src_vocab_size, W_y, b_y, max_len, show_attention, beam_size, show_candidates)
+      print(len(emb))
+      W_tgt = dy.parameter(self.W_tgt)
+      b_tgt = dy.parameter(self.b_tgt)
+      sent_tgt = self.make_encdec_caption(emb, self.tgt_lookup, self.tgt_token_to_id, self.tgt_id_to_token, self.tgt_vocab_size, W_tgt, b_tgt, self.tgt_enc_builder, self.tgt_dec_builder, max_len, show_attention)
+      return sent_tgt, []
+
+  def make_encdec_caption(self, avg_embeds, tgt_lookup, tgt_token_to_id, tgt_id_to_token, tgt_vocab_size, W_tgt, b_tgt, tgt_enc_builder, tgt_dec_builder, max_len, show_attention):
+    enc_state = tgt_enc_builder.initial_state()
+    for embed in avg_embeds:
+      enc_state = enc_state.add_input(embed)
+   
+    encoded = enc_state.output()
+    dec_state = tgt_dec_builder.initial_state([dy.vecInput(self.hidden_size), encoded])
+
+    trans_sentence = ['<S>']
+    cw = trans_sentence[0]
+
+    while len(trans_sentence) < max_len:
+        embed_t = dy.lookup(tgt_lookup, tgt_token_to_id[cw])
+        dec_state = dec_state.add_input(embed_t)
+        
+        y_star =  W_tgt*dec_state.output() + b_tgt
+        p = dy.softmax(y_star)
+        p_val = p.npvalue()
+        amax = np.argmax(p_val)
+
+        # Find the word corresponding to the best id
+        cw = tgt_id_to_token[amax]
+        if cw == '</S>':
+            break
+        trans_sentence.append(cw)
+
+    sent = ' '.join(trans_sentence[1:])
+    return sent
+
+    
 
   def encdec_losses(self, avg_embeds, tgt_batch, tgt_lookup, tgt_token_to_id, W_tgt, b_tgt, tgt_enc_builder, tgt_dec_builder):
 # note issues with avg_embed having different lengths between different sentences in batch
@@ -230,7 +282,7 @@ class Attention:
     total_words = 0
     tgt_cws = []
     masks = []
-    tgt_len = [len(sent) for sent in tgt_atch]
+    tgt_len = [len(sent) for sent in tgt_batch]
     max_len_tgt = max(tgt_len)
     total_words = sum(tgt_len)
     num_batches = len(tgt_batch)
@@ -247,7 +299,7 @@ class Attention:
       tgt_cws.append(row)
       masks.append(dy.reshape(dy.inputVector(mask), (1,), batch_size = num_batches))
     
-    dec_state = tgt_dec_builder.initial_state([encoded])
+    dec_state = tgt_dec_builder.initial_state([dy.vecInput(self.hidden_size), encoded])
 
 
     for i, (cws, nws, mask) in enumerate(zip(tgt_cws, tgt_cws[1:], masks)):
@@ -261,7 +313,7 @@ class Attention:
         mask_loss = dy.cmult(loss, mask)
         losses.append(mask_loss)
 
-    return (dy.sum_batches(dy.esum(losses))), total_words
+    return losses, total_words
 
   def compute_losses(self, batch, src_batch, src_lookup, src_token_to_id, W_y, b_y):
     W1_att_img = dy.parameter(self.W1_att_img) # attention_size * image_size
@@ -307,8 +359,30 @@ class Attention:
         y_star =  W_y*dec_state.output() + b_y #y_star is src_vocab_size * 1
 
         #HERE
-        p = dy.softmax(y_star)
-        avg_embeds.append(dy.transpose(src_lookup) * p)
+        if self.multilangmode == ENCDECPIPELINE:
+          p = dy.softmax(y_star) #p is src_vocab_size * 1
+          p_val_batch = p.npvalue()
+          #print(p_val_batch.shape)
+          q = p_val_batch.shape
+          if len(q) == 1: # batch size of one messes up dimensionality
+            amaxs = [np.argmax(p_val_batch)]
+          else:
+            amaxs = []
+            for p_val in p_val_batch.T:
+              amax = np.argmax(p_val)
+              amaxs.append(amax)
+          embeds = dy.lookup_batch(src_lookup, amaxs) # embeds is embed_size * 1
+          pick_p = dy.pick_batch(p, amaxs) # 1x1
+          embed_avg = embeds * pick_p
+          avg_embeds.append(embed_avg)
+          #candidate_ids = xrange(src_vocab_size)
+          #amaxs = heapq.nlargest(self.pipeline_candidates, candidate_ids, lambda id: p_val[id])
+          #embeds = dy.lookup_batch(src_lookup, amaxs) #
+          #p_sum = dy.sum_elems(p) 
+          #p_norm = p / p_sum
+          #embed_avg = embeds * p_norm
+
+          #avg_embeds.append(dy.transpose(src_lookup) * p)
         
         nwids = [src_token_to_id[nw] for nw in nws]
         loss = dy.pickneglogsoftmax_batch(y_star, nwids)
@@ -317,6 +391,7 @@ class Attention:
     return losses, total_words, avg_embeds
 
   def step_batch(self, batch, cnum):
+    #print("Batch size %d" % len(batch))
     dy.renew_cg()
     W_y = dy.parameter(self.W_y)
     b_y = dy.parameter(self.b_y)
@@ -324,20 +399,23 @@ class Attention:
     tgt_batch = [["<S>"]+x[2][cnum]+["</S>"] for x in batch]
 
     losses, total_words, avg_embeds = self.compute_losses(batch, src_batch, self.src_lookup, self.src_token_to_id, W_y, b_y)
+    sum1 = dy.sum_batches(dy.esum(losses))
 
     if self.multilang:
       W_tgt = dy.parameter(self.W_tgt)
       b_tgt = dy.parameter(self.b_tgt)
-      if self.multilang_mode == FORK:
+      if self.multilangmode == FORK:
         losses_tgt, total_words_tgt, avg_embeds_tgt = self.compute_losses(batch, tgt_batch, self.tgt_lookup, self.tgt_token_to_id, W_tgt, b_tgt)
-      elif self.multilang_mode == ENCDECPIPELINE:
+      elif self.multilangmode == ENCDECPIPELINE:
         tgt_enc_builder = self.tgt_enc_builder
         tgt_dec_builder = self.tgt_dec_builder
         losses_tgt, total_words_tgt = self.encdec_losses(avg_embeds, tgt_batch, self.tgt_lookup, self.tgt_token_to_id, W_tgt, b_tgt, tgt_enc_builder, tgt_dec_builder)
-      losses += losses_tgt
+      #losses = losses + losses_tgt
+      sum2 = dy.sum_batches(dy.esum(losses_tgt))
       total_words += total_words_tgt
+      return sum1 + sum2, total_words
 
-    return (dy.sum_batches(dy.esum(losses))), total_words
+    return sum1, total_words#(dy.sum_batches(dy.esum(losses))), total_words
 
 def dev_perplexity(dev_batches, encdec, num_captions):
     dev_loss = 0
@@ -385,12 +463,14 @@ def main():
   parser.add_argument('--output', default='out')
   parser.add_argument('--show_attention', action='store_true')
   parser.add_argument('--multilang', action='store_true')
+  parser.add_argument('--pipeline_candidates', default = 5) # ignored, always 1
   
   parser.add_argument('--multilangmode', default=FORK)
     # fork: one decoder, separate word embeddings
     # encdecpipeline: output of src used to generate tgt (enc-dec)
   
   parser.add_argument('--beam_size', default = 1)
+  parser.add_argument('--show_candidates', action='store_true') # if set, print the top [beam_size] candidates
   args = parser.parse_args()
 
   if os.path.isfile(args.captions_src):
@@ -428,7 +508,7 @@ def main():
 
   model = dy.Model()
   trainer = dy.AdamTrainer(model)
-  encdec = Attention(model, train_imgs, captions_train_src, captions_train_tgt, args.model_file, args.token_file, args.vocab_freq, args.embed_size, args.hidden_size, args.image_size, args.image_points, args.attention_size, args.dropout, builder, args.multilang, args.multilangmode)
+  encdec = Attention(model, train_imgs, captions_train_src, captions_train_tgt, args.model_file, args.token_file, args.vocab_freq, args.embed_size, args.hidden_size, args.image_size, args.image_points, args.attention_size, args.dropout, builder, args.multilang, args.multilangmode, args.pipeline_candidates)
   
   if args.eval and len(args.eval) > 0:
     for idx, eval_file in enumerate(args.eval):
@@ -437,13 +517,13 @@ def main():
           with open("output/"+eval_file+"."+args.output + ".tgt","w") as ft:
             test_imgs = get_imgs(eval_file)
             for img in test_imgs:
-              sent, att = encdec.make_caption(img, show_attention = args.show_attention, is_src = True, beam_size = beam_size)
+              sent, att = encdec.make_caption(img, show_attention = args.show_attention, is_src = True, beam_size = beam_size, show_candidates = args.show_candidates)
               print(sent)
               if(args.show_attention):
                 fa.write(json.dumps(att)+"\n")
               f.write(sent.encode("utf-8")+"\n")
               if args.multilang:
-                sent, att = encdec.make_caption(img, show_attention = args.show_attention, is_src = False, beam_size = beam_size)
+                sent, att = encdec.make_caption(img, show_attention = args.show_attention, is_src = False, beam_size = beam_size, show_candidates = args.show_candidates)
                 print(sent)
                 ft.write(sent.encode("utf-8")+"\n")
 
