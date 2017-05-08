@@ -1,4 +1,5 @@
 from collections import defaultdict
+import unicodedata
 def word_freqs(lines):
   word_frequencies = defaultdict(int)
   for line in lines:
@@ -60,3 +61,10 @@ def make_batches(training, batch_size, cnum, min_len = 3):
   if len(current_batch) > 0:
     batches.append(current_batch)
   return batches
+
+#http://stackoverflow.com/questions/11066400/remove-punctuation-from-unicode-formatted-strings
+def simple_tokenize(text):
+    return "".join(char for char in text if not unicodedata.category(char).startswith('P')).split(" ")
+
+
+
