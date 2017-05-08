@@ -14,6 +14,7 @@ ENCDECPIPELINE="encdecpipeline"
 ATTPIPELINE="attpipeline"
 FORK="fork"
 MRT="mrt"
+DUALATT="dualatt"
 
 def sample(p_val):
   spot = -1
@@ -82,9 +83,9 @@ class Attention:
           self.src_lookup, self.dec_builder, self.W_y, self.b_y, self.W1_att_img, self.W1_att_src, self.w2_att, self.tgt_lookup, self.W_tgt, self.b_tgt = model.load(model_file)
         elif multilangmode == ENCDECPIPELINE:
            self.src_lookup, self.dec_builder, self.W_y, self.b_y, self.W1_att_img, self.W1_att_src, self.w2_att, self.tgt_lookup, self.W_tgt, self.b_tgt, self.tgt_enc_builder, self.tgt_dec_builder = model.load(model_file)
-        elif multilangmode == ATTPIPELINE or multilangmode == MRT:
+        elif multilangmode == ATTPIPELINE or multilangmode == MRT or multilangmode == DUALATT:
            self.src_lookup, self.dec_builder, self.W_y, self.b_y, self.W1_att_img, self.W1_att_src, self.w2_att, self.tgt_lookup, self.W_tgt, self.b_tgt, self.W1_patt_src, self.W1_patt_tgt, self.w2_patt, self.tgt_dec_builder = model.load(model_file)
-
+       
       else:
         self.src_lookup, self.dec_builder, self.W_y, self.b_y, self.W1_att_img, self.W1_att_src, self.w2_att = model.load(model_file)
     else:
@@ -107,6 +108,11 @@ class Attention:
         self.W1_patt_tgt = model.add_parameters((self.attention_size, self.hidden_size))
         self.w2_patt = model.add_parameters((1,self.attention_size))
         self.tgt_dec_builder = builder(self.layers, self.embed_size + self.embed_size, self.hidden_size, model) # attention + current word
+      if multilangmode == DUALATT:
+        self.W1_patt_src = model.add_parameters((self.attention_size, self.embed_size+self.image_size))
+        self.W1_patt_tgt = model.add_parameters((self.attention_size, self.hidden_size))
+        self.w2_patt = model.add_parameters((1,self.attention_size))
+        self.tgt_dec_builder = builder(self.layers, self.embed_size + self.embed_size+ self.image_size, self.hidden_size, model) # attention + current word + current image
 
 
     self.pipeline_candidates = int(pipeline_candidates)
@@ -214,6 +220,70 @@ class Attention:
     #return sent
 
    
+  def do_make_dual_beam_caption(self, img, src_lookup, src_token_to_id, src_id_to_token, src_vocab_size, w_y, b_y, max_len, show_attention, beam_size, show_candidates):
+    if beam_size == 1:
+      return self.do_make_caption(img, src_lookup, src_token_to_id, src_id_to_token, W_y, b_y, max_len, show_attention, src_vocab_size)
+
+    W1_att_img = dy.parameter(self.W1_att_img) # attention_size * image_size
+    img_vec = dy.inputTensor(img) #image_points * image_size
+    h_fs_matrix = dy.transpose(img_vec)
+    trans_sentence = ['<S>']
+    w1 = W1_att_img * h_fs_matrix
+    cw = trans_sentence[0]
+    c_t = dy.vecInput(self.image_size)
+    start = dy.concatenate([dy.lookup(src_lookup, src_token_to_id['<S>']), c_t])
+    dec_state = self.dec_builder.initial_state().add_input(start)
+ 
+    candidates = []
+
+    candidates.append((trans_sentence, dec_state, 0))
+    position = 0
+    W1_att_src = dy.parameter(self.W1_att_src)
+    w2_att = dy.parameter(self.w2_att)
+
+    while position < max_len:
+      next_candidates = []
+      for (trans_sentence, dec_state, prob) in candidates:
+        cw = trans_sentence[-1]
+        if cw == '</S>':
+          next_candidates.append((trans_sentence, dec_state, prob))
+          continue
+
+        h_e = dec_state.output()
+        c_t, a_t = self.__attention_mlp(h_fs_matrix, h_e, w1, W1_att_src, w2_att)
+
+        embed_t = dy.lookup(src_lookup, src_token_to_id[cw])
+        x_t = dy.concatenate([embed_t, c_t])
+        
+        dec_state = dec_state.add_input(x_t)
+        y_star =  W_y*dec_state.output() + b_y
+        # Get probability distribution for the next word to be generated
+        p = dy.softmax(y_star)
+        p_val = p.npvalue() #vec_value
+        p_val[0] *= self.unk_penalty
+        
+        candidate_ids = xrange(src_vocab_size)
+        amaxs = heapq.nlargest(beam_size, candidate_ids, lambda id: p_val[id])
+        for next_id in amaxs:
+          next_prob = prob + math.log(p_val[next_id])
+          nw = src_id_to_token[next_id]
+          next_sentence = trans_sentence + [nw]
+          next_candidates.append((next_sentence, dec_state, next_prob))
+
+
+      candidates = heapq.nlargest(beam_size, next_candidates, lambda x: x[2])
+  
+      position += 1
+
+    #print(list([cand[0] for cand in candidates]))
+    if show_candidates:
+      out = ""
+      for cand in candidates:
+        out += " ".join(cand[0][1:-1]) + " | "
+      return out, [], []
+      
+
+    return " ".join(candidates[0][0][1:-1]), [], []
 
   def do_make_caption(self, img, src_lookup, src_token_to_id, src_id_to_token, W_y, b_y, max_len, show_attention, src_vocab_size):
     W1_att_img = dy.parameter(self.W1_att_img) # attention_size * image_size
@@ -398,6 +468,49 @@ class Attention:
         losses.append(mask_loss)
     return losses, total_words
 
+  def compute_embeds(self, src_batch, src_lookup, src_token_to_id):
+    total_words, src_cws, masks, num_batches = self.get_masks(src_batch)
+    embeds = list()
+    for cws in src_cws:
+      cwids = [src_token_to_id[cw] for cw in cws] 
+      embed_t = dy.lookup_batch(src_lookup, cwids)
+      embeds.append(embed_t)
+    return embeds
+
+  def dual_att_losses(self, avg_embeds, batch, tgt_batch, tgt_lookup, tgt_token_to_id, W_tgt, b_tgt, W1_patt_src, W1_patt_tgt, w2_patt, tgt_dec_builder, W1_att_img, W1_att_src, w2_att):
+    h_fs_matrix = dy.concatenate_cols(avg_embeds) #embed_size * sentence_len 
+    c_t = dy.vecInput(self.embed_size)
+    total_words, att_cws, masks, num_batches = self.get_masks(tgt_batch)
+    
+    img_vec = dy.inputTensor([x[0] for x in batch], batched = True)
+    h_fs_matrixi = dy.transpose(img_vec) #image_size * image_points
+    c_ti = dy.vecInput(self.image_size)
+
+    losses = []
+    start_tokens = ["<S>"] * num_batches
+    start_ids = [tgt_token_to_id[st] for st in start_tokens] 
+    start = dy.concatenate([dy.lookup_batch(tgt_lookup, start_ids), c_t, c_ti]) 
+    dec_state = tgt_dec_builder.initial_state().add_input(start)
+    w1 = W1_patt_src * h_fs_matrix
+    w1i = W1_att_img * h_fs_matrixi
+    avg_embeds = list()
+    for i, (cws, nws, mask) in enumerate(zip(att_cws, att_cws[1:], masks)):
+        h_e = dec_state.output()
+        c_t, a_t = self.__attention_mlp(h_fs_matrix, h_e, w1, W1_patt_tgt, w2_patt)
+        c_ti, a_ti = self.__attention_mlp(h_fs_matrixi, h_e, w1i, W1_att_src, w2_att)
+        cwids = [tgt_token_to_id[cw] for cw in cws] 
+        embed_t = dy.lookup_batch(tgt_lookup, cwids)
+
+        x_t = dy.concatenate([embed_t, c_ti])
+        dec_state = dec_state.add_input(x_t)
+
+        y_star =  W_tgt*dec_state.output() + b_tgt #y_star is src_vocab_size * 1
+        
+        nwids = [tgt_token_to_id[nw] for nw in nws]
+        loss = dy.pickneglogsoftmax_batch(y_star, nwids)
+        mask_loss = dy.cmult(loss, mask) * prob
+        losses.append(mask_loss)
+    return losses, total_words
 
   def get_masks(self, tgt_batch):
     total_words = 0
@@ -562,7 +675,7 @@ class Attention:
             else:
               embed_avg += embeds * pick_p
           avg_embeds.append(embed_avg)
-        elif self.multilangmode == MRT:
+        elif self.multilangmode == MRT or self.multilangmode == DUALATT:
           p = dy.softmax(y_star) #p is src_vocab_size * 1
           p_val_batch = p.npvalue()
           q = p_val_batch.shape
@@ -621,6 +734,17 @@ class Attention:
         tgt_dec_builder = self.tgt_dec_builder
 
         losses_tgt, total_words_tgt = self.att_losses(avg_embeds, tgt_batch, self.tgt_lookup, self.tgt_token_to_id, W_tgt, b_tgt, W1_patt_src, W1_patt_tgt, w2_patt, tgt_dec_builder,prob)
+      elif self.multilangmode == DUALATT:
+        W1_patt_src = dy.parameter(self.W1_patt_src)
+        W1_patt_tgt = dy.parameter(self.W1_patt_tgt)
+        w2_patt = dy.parameter(self.w2_patt)
+        tgt_dec_builder = self.tgt_dec_builder
+        W1_att_img = dy.parameter(self.W1_patt_img)
+        W1_att_src = dy.parameter(self.W1_patt_src)
+        w2_att = dy.parameter(self.w2_patt)
+
+        losses_tgt, total_words_tgt = self.dual_att_losses(avg_embeds, tgt_batch, self.tgt_lookup, self.tgt_token_to_id, W_tgt, b_tgt, W1_patt_src, W1_patt_tgt, w2_patt, tgt_dec_builder,W1_att_img, W1_att_src, w2_att)
+
 
       sum2 = dy.sum_batches(dy.esum(losses_tgt))
       total_words += total_words_tgt
