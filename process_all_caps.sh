@@ -17,3 +17,7 @@ cat tokenized/de/train/de_train.* > translate/train.de
 cat tokenized/en/val/val.* > translate/valid.en
 cat tokenized/de/val/de_val.* > translate/valid.de
 
+python join_refs.py tokenized/en/train/train.* > refs/train.en
+python join_refs.py tokenized/de/train/de_train.* > refs/train.de
+python join_refs.py tokenized/en/val/val.* > refs/valid.en
+python join_refs.py tokenized/de/val/de_val.* > refs/valid.de
