@@ -220,26 +220,35 @@ class Attention:
     #return sent
 
    
-  def do_make_dual_beam_caption(self, img, src_lookup, src_token_to_id, src_id_to_token, src_vocab_size, w_y, b_y, max_len, show_attention, beam_size, show_candidates):
-    if beam_size == 1:
-      return self.do_make_caption(img, src_lookup, src_token_to_id, src_id_to_token, W_y, b_y, max_len, show_attention, src_vocab_size)
+  def do_make_dual_beam_caption(self, avg_embeds, img, src_lookup, src_token_to_id, src_id_to_token, src_vocab_size, w_y, b_y, max_len, show_attention, beam_size, show_candidates):
+    #if beam_size == 1:
+    #  return self.do_make_caption(img, src_lookup, src_token_to_id, src_id_to_token, W_y, b_y, max_len, show_attention, src_vocab_size)
+    h_fs_matrix = dy.concatenate_cols(avg_embeds) #embed_size * sentence_len 
+    c_t = dy.vecInput(self.embed_size)
+    total_words, att_cws, masks, num_batches = self.get_masks(tgt_batch)
 
-    W1_att_img = dy.parameter(self.W1_att_img) # attention_size * image_size
     img_vec = dy.inputTensor(img) #image_points * image_size
-    h_fs_matrix = dy.transpose(img_vec)
+    h_fs_matrixi = dy.transpose(img_vec)
+    c_ti = dy.vecInput(self.image_size)
+    
+    W1_att_img = dy.parameter(self.W1_att_img) # attention_size * image_size
+    W1_att_src = dy.parameter(self.W1_att_src)
+    w2_att = dy.parameter(self.w2_att)
+    W1_patt_src = dy.parameter(self.W1_patt_src) # attention_size * image_size
+    W1_patt_tgt = dy.parameter(self.W1_patt_tgt)
+    w2_patt = dy.parameter(self.w2_patt)
+
     trans_sentence = ['<S>']
-    w1 = W1_att_img * h_fs_matrix
+    w1 = W1_att_img * h_fs_matrixi
+    w1i = W1_patt_src * h_fs_matrix
     cw = trans_sentence[0]
-    c_t = dy.vecInput(self.image_size)
-    start = dy.concatenate([dy.lookup(src_lookup, src_token_to_id['<S>']), c_t])
+    start = dy.concatenate([dy.lookup(src_lookup, src_token_to_id['<S>']), c_t, c_ti])
     dec_state = self.dec_builder.initial_state().add_input(start)
  
     candidates = []
 
     candidates.append((trans_sentence, dec_state, 0))
     position = 0
-    W1_att_src = dy.parameter(self.W1_att_src)
-    w2_att = dy.parameter(self.w2_att)
 
     while position < max_len:
       next_candidates = []
@@ -250,7 +259,8 @@ class Attention:
           continue
 
         h_e = dec_state.output()
-        c_t, a_t = self.__attention_mlp(h_fs_matrix, h_e, w1, W1_att_src, w2_att)
+        c_t, a_t = self.__attention_mlp(h_fs_matrix, h_e, w1, W1_patt_tgt, w2_patt)
+        c_ti, a_ti = self.__attention_mlp(h_fs_matrixi, h_e, w1i, W1_att_src, w2_att)
 
         embed_t = dy.lookup(src_lookup, src_token_to_id[cw])
         x_t = dy.concatenate([embed_t, c_t])
@@ -341,7 +351,7 @@ class Attention:
     sent = ' '.join(trans_sentence[1:])
     return sent, att, embeds
 
-  def make_caption(self, img, max_len = 30, show_attention = False, is_src = True, beam_size = 1, show_candidates = False):
+  def make_caption(self, img, max_len = 30, show_attention = False, is_src = True, beam_size = 1, show_candidates = False, src_sent = None):
     dy.renew_cg()
 
     if is_src:
@@ -371,7 +381,9 @@ class Attention:
         W1_patt_tgt = dy.parameter(self.W1_patt_tgt)
         w2_patt = dy.parameter(self.w2_patt)
         return self.make_att_caption(emb, self.tgt_lookup, self.tgt_token_to_id, self.tgt_id_to_token, self.tgt_vocab_size, W_tgt, b_tgt, W1_patt_src, W1_patt_tgt, w2_patt, self.tgt_dec_builder, max_len, show_attention)
-
+    elif self.multilangmode == DUALATT:
+      avg_embeds = compute_embed_simple(src_sent, self.src_lookup, self.src_token_to_id)
+      
 
   def make_encdec_caption(self, avg_embeds, tgt_lookup, tgt_token_to_id, tgt_id_to_token, tgt_vocab_size, W_tgt, b_tgt, tgt_enc_builder, tgt_dec_builder, max_len):
     enc_state = tgt_enc_builder.initial_state()
@@ -467,6 +479,12 @@ class Attention:
         mask_loss = dy.cmult(loss, mask) * prob
         losses.append(mask_loss)
     return losses, total_words
+
+  def compute_embed_simple(self, sentence, src_lookup, src_token_to_id):
+    embeds = list()
+    for word in sentence.split(" "):
+      embeds.append(dy.lookup(src_lookup, src_token_to_id[word]))
+    return embeds
 
   def compute_embeds(self, src_batch, src_lookup, src_token_to_id):
     total_words, src_cws, masks, num_batches = self.get_masks(src_batch)
@@ -743,7 +761,7 @@ class Attention:
         W1_att_src = dy.parameter(self.W1_patt_src)
         w2_att = dy.parameter(self.w2_patt)
 
-        losses_tgt, total_words_tgt = self.dual_att_losses(avg_embeds, tgt_batch, self.tgt_lookup, self.tgt_token_to_id, W_tgt, b_tgt, W1_patt_src, W1_patt_tgt, w2_patt, tgt_dec_builder,W1_att_img, W1_att_src, w2_att)
+        losses_tgt, total_words_tgt = self.dual_att_losses(avg_embeds, batch, tgt_batch, self.tgt_lookup, self.tgt_token_to_id, W_tgt, b_tgt, W1_patt_src, W1_patt_tgt, w2_patt, tgt_dec_builder,W1_att_img, W1_att_src, w2_att)
 
 
       sum2 = dy.sum_batches(dy.esum(losses_tgt))
