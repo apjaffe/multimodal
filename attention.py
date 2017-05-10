@@ -46,7 +46,7 @@ def rnn_builder(layer_depth, emb_size, hidden_size, model):
   return dy.SimpleRNNBuilder(layer_depth, emb_size, hidden_size, model)
 
 class Attention:
-  def __init__(self, model, imgs, captions_src, captions_tgt, model_file, token_file, min_freq, embed_size, hidden_size, image_size, image_points, attention_size, dropout, builder, multilang, multilangmode, pipeline_candidates, sample_embeds, unk_penalty):
+  def __init__(self, model, imgs, captions_src, captions_tgt, model_file, token_file, min_freq, embed_size, hidden_size, image_size, image_points, attention_size, dropout, builder, multilang, multilangmode, pipeline_candidates, sample_embeds, unk_penalty, fake_ratio):
     self.model = model
     self.src_freqs = mt_util.word_freqs(captions_src)
     self.tgt_freqs = mt_util.word_freqs(captions_tgt)
@@ -60,6 +60,7 @@ class Attention:
     self.multilang = multilang
     self.multilangmode = multilangmode
     self.unk_penalty = float(unk_penalty)
+    self.fake_ratio = int(fake_ratio)
     self.max_len = 20 # for MRT, not for generation
     if os.path.isfile("tokens/src"+token_file):
       self.src_token_to_id = mt_util.defaultify(json.load(open("tokens/src"+token_file)))
@@ -642,7 +643,7 @@ class Attention:
     
     #return losses, total_words, avg_embeds
 
-  def compute_losses(self, batch, src_batch, src_lookup, src_token_to_id, W_y, b_y):
+  def compute_losses(self, batch, src_batch, src_lookup, src_token_to_id, W_y, b_y, make_embeds):
     W1_att_img = dy.parameter(self.W1_att_img) # attention_size * image_size
     losses = []
     total_words = 0
@@ -675,13 +676,32 @@ class Attention:
 
         y_star =  W_y*dec_state.output() + b_y #y_star is src_vocab_size * 1
 
-        if self.multilangmode == ENCDECPIPELINE or self.multilangmode == ATTPIPELINE:
-          p = dy.softmax(y_star) #p is src_vocab_size * 1
-          p_val_batch = p.npvalue()
-          #print(p_val_batch.shape)
-          q = p_val_batch.shape
-          embed_avg = None
-          for i in xrange(self.pipeline_candidates):  
+        if make_embeds:
+          if self.multilangmode == ENCDECPIPELINE or self.multilangmode == ATTPIPELINE:
+            p = dy.softmax(y_star) #p is src_vocab_size * 1
+            p_val_batch = p.npvalue()
+            #print(p_val_batch.shape)
+            q = p_val_batch.shape
+            embed_avg = None
+            for i in xrange(self.pipeline_candidates):  
+              if len(q) == 1: # batch size of one messes up dimensionality
+                amaxs = [self.sampler(p_val_batch)]
+              else:
+                amaxs = []
+                for p_val in p_val_batch.T:
+                  amax = self.sampler(p_val)
+                  amaxs.append(amax)
+              embeds = dy.lookup_batch(src_lookup, amaxs) # embeds is embed_size * 1
+              pick_p = dy.pick_batch(p, amaxs) # 1x1
+              if embed_avg is None:
+                embed_avg = embeds*pick_p
+              else:
+                embed_avg += embeds * pick_p
+            avg_embeds.append(embed_avg)
+          elif self.multilangmode == MRT or self.multilangmode == DUALATT:
+            p = dy.softmax(y_star) #p is src_vocab_size * 1
+            p_val_batch = p.npvalue()
+            q = p_val_batch.shape
             if len(q) == 1: # batch size of one messes up dimensionality
               amaxs = [self.sampler(p_val_batch)]
             else:
@@ -690,27 +710,9 @@ class Attention:
                 amax = self.sampler(p_val)
                 amaxs.append(amax)
             embeds = dy.lookup_batch(src_lookup, amaxs) # embeds is embed_size * 1
-            pick_p = dy.pick_batch(p, amaxs) # 1x1
-            if embed_avg is None:
-              embed_avg = embeds*pick_p
-            else:
-              embed_avg += embeds * pick_p
-          avg_embeds.append(embed_avg)
-        elif self.multilangmode == MRT or self.multilangmode == DUALATT:
-          p = dy.softmax(y_star) #p is src_vocab_size * 1
-          p_val_batch = p.npvalue()
-          q = p_val_batch.shape
-          if len(q) == 1: # batch size of one messes up dimensionality
-            amaxs = [self.sampler(p_val_batch)]
-          else:
-            amaxs = []
-            for p_val in p_val_batch.T:
-              amax = self.sampler(p_val)
-              amaxs.append(amax)
-          embeds = dy.lookup_batch(src_lookup, amaxs) # embeds is embed_size * 1
-          pick_p = dy.pick_batch(p, amaxs)
-          prob *= pick_p
-          avg_embeds.append(embeds)
+            pick_p = dy.pick_batch(p, amaxs)
+            prob *= pick_p
+            avg_embeds.append(embeds)
 
           #candidate_ids = xrange(src_vocab_size)
           #amaxs = heapq.nlargest(self.pipeline_candidates, candidate_ids, lambda id: p_val[id])
@@ -735,14 +737,21 @@ class Attention:
     src_batch = [["<S>"]+x[1][cnum]+["</S>"] for x in batch]
     tgt_batch = [["<S>"]+x[2][cnum2]+["</S>"] for x in batch]
 
-    losses, total_words, avg_embeds, prob = self.compute_losses(batch, src_batch, self.src_lookup, self.src_token_to_id, W_y, b_y)
+    make_embeds = True
+    if self.multilangmode == DUALATT:
+      make_embeds = (random.randint(1,self.fake_ratio) == 1)
+
+    losses, total_words, avg_embeds, prob = self.compute_losses(batch, src_batch, self.src_lookup, self.src_token_to_id, W_y, b_y, make_embeds)
     sum1 = dy.sum_batches(dy.esum(losses))
+
+    if not make_embeds:
+      avg_embeds = self.compute_embeds(src_batch, self.src_lookup, self.src_token_to_id)
 
     if self.multilang:
       W_tgt = dy.parameter(self.W_tgt)
       b_tgt = dy.parameter(self.b_tgt)
       if self.multilangmode == FORK:
-        losses_tgt, total_words_tgt, avg_embeds_tgt = self.compute_losses(batch, tgt_batch, self.tgt_lookup, self.tgt_token_to_id, W_tgt, b_tgt)
+        losses_tgt, total_words_tgt, tgt_avg_embeds, tgt_prob = self.compute_losses(batch, tgt_batch, self.tgt_lookup, self.tgt_token_to_id, W_tgt, b_tgt)
       elif self.multilangmode == ENCDECPIPELINE:
         tgt_enc_builder = self.tgt_enc_builder
         tgt_dec_builder = self.tgt_dec_builder
@@ -830,6 +839,7 @@ def main():
   parser.add_argument('--sample_embeds', default = 'argmax')
   parser.add_argument('--simple_tokenize', action='store_true')
   parser.add_argument('--unk_penalty', default=1.0)
+  parser.add_argument('--fake_ratio', default=1)
   args = parser.parse_args()
 
   tokenizer = mt_util.simple_tokenize if args.simple_tokenize else word_tokenize
@@ -870,7 +880,7 @@ def main():
 
   model = dy.Model()
   trainer = dy.AdamTrainer(model)
-  encdec = Attention(model, train_imgs, captions_train_src, captions_train_tgt, args.model_file, args.token_file, args.vocab_freq, args.embed_size, args.hidden_size, args.image_size, args.image_points, args.attention_size, args.dropout, builder, args.multilang, args.multilangmode, args.pipeline_candidates, args.sample_embeds, args.unk_penalty)
+  encdec = Attention(model, train_imgs, captions_train_src, captions_train_tgt, args.model_file, args.token_file, args.vocab_freq, args.embed_size, args.hidden_size, args.image_size, args.image_points, args.attention_size, args.dropout, builder, args.multilang, args.multilangmode, args.pipeline_candidates, args.sample_embeds, args.unk_penalty, args.fake_ratio)
   
   if args.eval and len(args.eval) > 0:
     for idx, eval_file in enumerate(args.eval):
