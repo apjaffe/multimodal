@@ -47,7 +47,7 @@ def rnn_builder(layer_depth, emb_size, hidden_size, model):
   return dy.SimpleRNNBuilder(layer_depth, emb_size, hidden_size, model)
 
 class Attention:
-  def __init__(self, model, imgs, captions_src, captions_tgt, model_file, token_file, min_freq, embed_size, hidden_size, image_size, image_points, attention_size, dropout, builder, multilang, multilangmode, pipeline_candidates, sample_embeds, unk_penalty):
+  def __init__(self, model, imgs, captions_src, captions_tgt, model_file, token_file, min_freq, embed_size, hidden_size, image_size, image_points, attention_size, dropout, builder, multilang, multilangmode, pipeline_candidates, sample_embeds, unk_penalty, fake_ratio):
     self.model = model
     self.src_freqs = mt_util.word_freqs(captions_src)
     self.tgt_freqs = mt_util.word_freqs(captions_tgt)
@@ -61,6 +61,7 @@ class Attention:
     self.multilang = multilang
     self.multilangmode = multilangmode
     self.unk_penalty = float(unk_penalty)
+    self.fake_ratio = int(fake_ratio)
     self.max_len = 20 # for MRT, not for generation
     if os.path.isfile("tokens/src"+token_file):
       self.src_token_to_id = mt_util.defaultify(json.load(open("tokens/src"+token_file)))
@@ -110,7 +111,7 @@ class Attention:
         self.w2_patt = model.add_parameters((1,self.attention_size))
         self.tgt_dec_builder = builder(self.layers, self.embed_size + self.embed_size, self.hidden_size, model) # attention + current word
       if multilangmode == DUALATT:
-        self.W1_patt_src = model.add_parameters((self.attention_size, self.embed_size+self.image_size))
+        self.W1_patt_src = model.add_parameters((self.attention_size, self.embed_size))
         self.W1_patt_tgt = model.add_parameters((self.attention_size, self.hidden_size))
         self.w2_patt = model.add_parameters((1,self.attention_size))
         self.tgt_dec_builder = builder(self.layers, self.embed_size + self.embed_size+ self.image_size, self.hidden_size, model) # attention + current word + current image
@@ -122,7 +123,7 @@ class Attention:
       self.params += [self.tgt_lookup, self.W_tgt, self.b_tgt]
     if multilangmode == ENCDECPIPELINE or multilangmode == ENCDECPIPELINE2:
       self.params += [self.tgt_enc_builder, self.tgt_dec_builder]
-    if multilangmode == ATTPIPELINE or multilangmode == MRT:
+    if multilangmode == ATTPIPELINE or multilangmode == MRT or multilangmode == DUALATT:
       self.params += [self.W1_patt_src, self.W1_patt_tgt, self.w2_patt, self.tgt_dec_builder]
       
     if sample_embeds == "argmax":
@@ -221,12 +222,11 @@ class Attention:
     #return sent
 
    
-  def do_make_dual_beam_caption(self, avg_embeds, img, src_lookup, src_token_to_id, src_id_to_token, src_vocab_size, w_y, b_y, max_len, show_attention, beam_size, show_candidates):
+  def do_make_dual_beam_caption(self, avg_embeds, img, src_lookup, src_token_to_id, src_id_to_token, src_vocab_size, W_y, b_y, dec_builder, max_len, show_attention, beam_size, show_candidates):
     #if beam_size == 1:
     #  return self.do_make_caption(img, src_lookup, src_token_to_id, src_id_to_token, W_y, b_y, max_len, show_attention, src_vocab_size)
     h_fs_matrix = dy.concatenate_cols(avg_embeds) #embed_size * sentence_len 
     c_t = dy.vecInput(self.embed_size)
-    total_words, att_cws, masks, num_batches = self.get_masks(tgt_batch)
 
     img_vec = dy.inputTensor(img) #image_points * image_size
     h_fs_matrixi = dy.transpose(img_vec)
@@ -240,11 +240,11 @@ class Attention:
     w2_patt = dy.parameter(self.w2_patt)
 
     trans_sentence = ['<S>']
-    w1 = W1_att_img * h_fs_matrixi
-    w1i = W1_patt_src * h_fs_matrix
+    w1 = W1_patt_src * h_fs_matrix
+    w1i = W1_att_img * h_fs_matrixi
     cw = trans_sentence[0]
     start = dy.concatenate([dy.lookup(src_lookup, src_token_to_id['<S>']), c_t, c_ti])
-    dec_state = self.dec_builder.initial_state().add_input(start)
+    dec_state = dec_builder.initial_state().add_input(start)
  
     candidates = []
 
@@ -264,9 +264,10 @@ class Attention:
         c_ti, a_ti = self.__attention_mlp(h_fs_matrixi, h_e, w1i, W1_att_src, w2_att)
 
         embed_t = dy.lookup(src_lookup, src_token_to_id[cw])
-        x_t = dy.concatenate([embed_t, c_t])
+        x_t = dy.concatenate([embed_t, c_t, c_ti])
         
         dec_state = dec_state.add_input(x_t)
+        #print(W_y.npvalue().shape, dec_state.output().npvalue().shape, b_y.npvalue().shape)
         y_star =  W_y*dec_state.output() + b_y
         # Get probability distribution for the next word to be generated
         p = dy.softmax(y_star)
@@ -294,7 +295,7 @@ class Attention:
       return out, [], []
       
 
-    return " ".join(candidates[0][0][1:-1]), [], []
+    return " ".join(candidates[0][0][1:-1]), []
 
   def do_make_caption(self, img, src_lookup, src_token_to_id, src_id_to_token, W_y, b_y, max_len, show_attention, src_vocab_size):
     W1_att_img = dy.parameter(self.W1_att_img) # attention_size * image_size
@@ -317,9 +318,10 @@ class Attention:
           att.append(a_t.value().tolist())
 
         embed_t = dy.lookup(src_lookup, src_token_to_id[cw])
-        x_t = dy.concatenate([embed_t, c_t])
+        x_t = dy.concatenate([embed_t, c_t, c_ti])
         
         dec_state = dec_state.add_input(x_t)
+        #print(W_y.npvalue().shape, dec_state.output().npvalue().shape, b_y.npvalue().shape)
         y_star =  W_y*dec_state.output() + b_y
         # Get probability distribution for the next word to be generated
         p = dy.softmax(y_star)
@@ -386,7 +388,10 @@ class Attention:
         w2_patt = dy.parameter(self.w2_patt)
         return self.make_att_caption(emb, self.tgt_lookup, self.tgt_token_to_id, self.tgt_id_to_token, self.tgt_vocab_size, W_tgt, b_tgt, W1_patt_src, W1_patt_tgt, w2_patt, self.tgt_dec_builder, max_len, show_attention)
     elif self.multilangmode == DUALATT:
-      avg_embeds = compute_embed_simple(src_sent, self.src_lookup, self.src_token_to_id)
+      avg_embeds = self.compute_embed_simple(src_sent, self.src_lookup, self.src_token_to_id)
+      W_tgt = dy.parameter(self.W_tgt)
+      b_tgt = dy.parameter(self.b_tgt)
+      return self.do_make_dual_beam_caption(avg_embeds, img, self.tgt_lookup, self.tgt_token_to_id, self.tgt_id_to_token, self.tgt_vocab_size, W_tgt, b_tgt, self.tgt_dec_builder, max_len, show_attention, beam_size, show_candidates)
       
 
   def make_encdec_caption(self, avg_embeds, tgt_lookup, tgt_token_to_id, tgt_id_to_token, tgt_vocab_size, W_tgt, b_tgt, tgt_enc_builder, tgt_dec_builder, max_len):
@@ -527,14 +532,14 @@ class Attention:
         cwids = [tgt_token_to_id[cw] for cw in cws] 
         embed_t = dy.lookup_batch(tgt_lookup, cwids)
 
-        x_t = dy.concatenate([embed_t, c_ti])
+        x_t = dy.concatenate([embed_t, c_t, c_ti])
         dec_state = dec_state.add_input(x_t)
 
         y_star =  W_tgt*dec_state.output() + b_tgt #y_star is src_vocab_size * 1
         
         nwids = [tgt_token_to_id[nw] for nw in nws]
         loss = dy.pickneglogsoftmax_batch(y_star, nwids)
-        mask_loss = dy.cmult(loss, mask) * prob
+        mask_loss = dy.cmult(loss, mask)
         losses.append(mask_loss)
     return losses, total_words
 
@@ -651,7 +656,7 @@ class Attention:
     
     #return losses, total_words, avg_embeds
 
-  def compute_losses(self, batch, src_batch, src_lookup, src_token_to_id, W_y, b_y):
+  def compute_losses(self, batch, src_batch, src_lookup, src_token_to_id, W_y, b_y, make_embeds):
     W1_att_img = dy.parameter(self.W1_att_img) # attention_size * image_size
     losses = []
     total_words = 0
@@ -748,14 +753,21 @@ class Attention:
     src_batch = [["<S>"]+x[1][cnum]+["</S>"] for x in batch]
     tgt_batch = [["<S>"]+x[2][cnum2]+["</S>"] for x in batch]
 
-    losses, total_words, avg_embeds, prob = self.compute_losses(batch, src_batch, self.src_lookup, self.src_token_to_id, W_y, b_y)
+    make_embeds = True
+    if self.multilangmode == DUALATT:
+      make_embeds = (random.randint(1,self.fake_ratio) == 1)
+
+    losses, total_words, avg_embeds, prob = self.compute_losses(batch, src_batch, self.src_lookup, self.src_token_to_id, W_y, b_y, make_embeds)
     sum1 = dy.sum_batches(dy.esum(losses))
+
+    if not make_embeds:
+      avg_embeds = self.compute_embeds(src_batch, self.src_lookup, self.src_token_to_id)
 
     if self.multilang:
       W_tgt = dy.parameter(self.W_tgt)
       b_tgt = dy.parameter(self.b_tgt)
       if self.multilangmode == FORK:
-        losses_tgt, total_words_tgt, avg_embeds_tgt = self.compute_losses(batch, tgt_batch, self.tgt_lookup, self.tgt_token_to_id, W_tgt, b_tgt)
+        losses_tgt, total_words_tgt, tgt_avg_embeds, tgt_prob = self.compute_losses(batch, tgt_batch, self.tgt_lookup, self.tgt_token_to_id, W_tgt, b_tgt)
       elif self.multilangmode == ENCDECPIPELINE or self.multilangmode == ENCDECPIPELINE2:
         tgt_enc_builder = self.tgt_enc_builder
         tgt_dec_builder = self.tgt_dec_builder
@@ -773,9 +785,9 @@ class Attention:
         W1_patt_tgt = dy.parameter(self.W1_patt_tgt)
         w2_patt = dy.parameter(self.w2_patt)
         tgt_dec_builder = self.tgt_dec_builder
-        W1_att_img = dy.parameter(self.W1_patt_img)
-        W1_att_src = dy.parameter(self.W1_patt_src)
-        w2_att = dy.parameter(self.w2_patt)
+        W1_att_img = dy.parameter(self.W1_att_img)
+        W1_att_src = dy.parameter(self.W1_att_src)
+        w2_att = dy.parameter(self.w2_att)
 
         losses_tgt, total_words_tgt = self.dual_att_losses(avg_embeds, batch, tgt_batch, self.tgt_lookup, self.tgt_token_to_id, W_tgt, b_tgt, W1_patt_src, W1_patt_tgt, w2_patt, tgt_dec_builder,W1_att_img, W1_att_src, w2_att)
 
@@ -843,6 +855,7 @@ def main():
   parser.add_argument('--sample_embeds', default = 'argmax')
   parser.add_argument('--simple_tokenize', action='store_true')
   parser.add_argument('--unk_penalty', default=1.0)
+  parser.add_argument('--fake_ratio', default=1)
   args = parser.parse_args()
 
   tokenizer = mt_util.simple_tokenize if args.simple_tokenize else word_tokenize
@@ -883,7 +896,7 @@ def main():
 
   model = dy.Model()
   trainer = dy.AdamTrainer(model)
-  encdec = Attention(model, train_imgs, captions_train_src, captions_train_tgt, args.model_file, args.token_file, args.vocab_freq, args.embed_size, args.hidden_size, args.image_size, args.image_points, args.attention_size, args.dropout, builder, args.multilang, args.multilangmode, args.pipeline_candidates, args.sample_embeds, args.unk_penalty)
+  encdec = Attention(model, train_imgs, captions_train_src, captions_train_tgt, args.model_file, args.token_file, args.vocab_freq, args.embed_size, args.hidden_size, args.image_size, args.image_points, args.attention_size, args.dropout, builder, args.multilang, args.multilangmode, args.pipeline_candidates, args.sample_embeds, args.unk_penalty, args.fake_ratio)
   
   if args.eval and len(args.eval) > 0:
     for idx, eval_file in enumerate(args.eval):
@@ -898,7 +911,7 @@ def main():
                 fa.write(json.dumps(att)+"\n")
               f.write(sent.encode("utf-8")+"\n")
               if args.multilang:
-                sent, att = encdec.make_caption(img, show_attention = args.show_attention, is_src = False, beam_size = beam_size, show_candidates = args.show_candidates)
+                sent, att = encdec.make_caption(img, show_attention = args.show_attention, is_src = False, beam_size = beam_size, show_candidates = args.show_candidates, src_sent = sent)
                 print(sent)
                 ft.write(sent.encode("utf-8")+"\n")
 
@@ -940,11 +953,16 @@ def main():
           trainer.update()
         
         if tidx % 100 == 0:
-          print(encdec.make_caption(valid_imgs[0], is_src = True)[0])
-          print(encdec.make_caption(valid_imgs[1], is_src = True)[0])
+          sent1 = encdec.make_caption(valid_imgs[0], is_src = True)[0]
+          sent2 = encdec.make_caption(valid_imgs[1], is_src = True)[0]
+          sent3 = encdec.make_caption(valid_imgs[4], is_src = True)[0]
+          print(sent1)
+          print(sent2)
+          print(sent3)
           if args.multilang:
-            print(encdec.make_caption(valid_imgs[0], is_src = False)[0])
-            print(encdec.make_caption(valid_imgs[1], is_src = False)[0])
+            print(encdec.make_caption(valid_imgs[0], is_src = False, src_sent = sent1)[0])
+            print(encdec.make_caption(valid_imgs[1], is_src = False, src_sent = sent2)[0])
+            print(encdec.make_caption(valid_imgs[4], is_src = False, src_sent = sent3)[0])
           print("Batch %d with loss %f" % (tidx, partial_loss / partial_words))
           partial_loss = 0
           partial_words = 0
