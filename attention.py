@@ -90,7 +90,10 @@ class Attention:
       else:
         self.src_lookup, self.dec_builder, self.W_y, self.b_y, self.W1_att_img, self.W1_att_src, self.w2_att = model.load(model_file)
     else:
-      self.src_lookup = model.add_lookup_parameters((self.src_vocab_size, self.embed_size))
+      if sample_embeds == "average":
+        self.src_lookup = model.add_parameters((self.src_vocab_size, self.embed_size))
+      else:
+        self.src_lookup = model.add_lookup_parameters((self.src_vocab_size, self.embed_size))
       self.dec_builder = builder(self.layers, self.embed_size + self.image_size, self.hidden_size, model)
       self.W_y = model.add_parameters((self.src_vocab_size, self.hidden_size))
       self.b_y = model.add_parameters((self.src_vocab_size))
@@ -125,17 +128,39 @@ class Attention:
     if multilangmode == ATTPIPELINE or multilangmode == MRT:
       self.params += [self.W1_patt_src, self.W1_patt_tgt, self.w2_patt, self.tgt_dec_builder]
       
+    self.sample_embeds = sample_embeds
     if sample_embeds == "argmax":
       self.sampler = np.argmax
     elif sample_embeds == "random":
       self.sampler = sample
     elif sample_embeds == "uniform":
       self.sampler = np.random.choice
+    elif sample_embeds == "average":
+      pass
     else:
       print("Invalid sampler %s" % sampler_embeds)
 
     self.dec_builder.set_dropout(float(dropout))
+
+  def get_src_lookup(self):
+    if self.sample_embeds == "average":
+      return dy.parameter(self.src_lookup)
+    else:
+      return self.src_lookup
+
+  def lookup(self, src_lookup, val):
+    if self.sample_embeds == "average" and hasattr(src_lookup, "dim"):
+      return dy.pick(src_lookup, val)
+    else:
+      return dy.lookup(src_lookup, val)
  
+  def lookup_batch(self, src_lookup, vals):
+    if self.sample_embeds == "average" and hasattr(src_lookup, "dim"):
+      return dy.pick_batch(dy.concatenate_to_batch([src_lookup] * len(vals)), vals)
+    else:
+      return dy.lookup_batch(src_lookup, vals)
+    
+
   # Calculates the context vector using a MLP
   # h_fs: matrix of embeddings for the source words
   # h_e: hidden state of the decoder
@@ -153,9 +178,9 @@ class Attention:
       c_t = h_fs_matrix * alignment
       return c_t, alignment # image_size x 1, image_points x 1
   
-  def do_make_beam_caption(self, img, src_lookup, src_token_to_id, src_id_to_token, src_vocab_size, W_y, b_y, max_len, show_attention, beam_size, show_candidates):
+  def do_make_beam_caption(self, img, src_lookup, src_token_to_id, src_id_to_token, src_vocab_size, W_y, b_y, max_len, show_attention, beam_size, show_candidates, make_embeds = False):
     if beam_size == 1:
-      return self.do_make_caption(img, src_lookup, src_token_to_id, src_id_to_token, W_y, b_y, max_len, show_attention, src_vocab_size)
+      return self.do_make_caption(img, src_lookup, src_token_to_id, src_id_to_token, W_y, b_y, max_len, show_attention, src_vocab_size, make_embeds)
 
     W1_att_img = dy.parameter(self.W1_att_img) # attention_size * image_size
     img_vec = dy.inputTensor(img) #image_points * image_size
@@ -164,7 +189,7 @@ class Attention:
     w1 = W1_att_img * h_fs_matrix
     cw = trans_sentence[0]
     c_t = dy.vecInput(self.image_size)
-    start = dy.concatenate([dy.lookup(src_lookup, src_token_to_id['<S>']), c_t])
+    start = dy.concatenate([self.lookup(src_lookup, src_token_to_id['<S>']), c_t])
     dec_state = self.dec_builder.initial_state().add_input(start)
  
     candidates = []
@@ -185,7 +210,7 @@ class Attention:
         h_e = dec_state.output()
         c_t, a_t = self.__attention_mlp(h_fs_matrix, h_e, w1, W1_att_src, w2_att)
 
-        embed_t = dy.lookup(src_lookup, src_token_to_id[cw])
+        embed_t = self.lookup(src_lookup, src_token_to_id[cw])
         x_t = dy.concatenate([embed_t, c_t])
         
         dec_state = dec_state.add_input(x_t)
@@ -243,7 +268,7 @@ class Attention:
     w1 = W1_att_img * h_fs_matrixi
     w1i = W1_patt_src * h_fs_matrix
     cw = trans_sentence[0]
-    start = dy.concatenate([dy.lookup(src_lookup, src_token_to_id['<S>']), c_t, c_ti])
+    start = dy.concatenate([self.lookup(src_lookup, src_token_to_id['<S>']), c_t, c_ti])
     dec_state = self.dec_builder.initial_state().add_input(start)
  
     candidates = []
@@ -263,7 +288,7 @@ class Attention:
         c_t, a_t = self.__attention_mlp(h_fs_matrix, h_e, w1, W1_patt_tgt, w2_patt)
         c_ti, a_ti = self.__attention_mlp(h_fs_matrixi, h_e, w1i, W1_att_src, w2_att)
 
-        embed_t = dy.lookup(src_lookup, src_token_to_id[cw])
+        embed_t = self.lookup(src_lookup, src_token_to_id[cw])
         x_t = dy.concatenate([embed_t, c_t])
         
         dec_state = dec_state.add_input(x_t)
@@ -296,7 +321,7 @@ class Attention:
 
     return " ".join(candidates[0][0][1:-1]), [], []
 
-  def do_make_caption(self, img, src_lookup, src_token_to_id, src_id_to_token, W_y, b_y, max_len, show_attention, src_vocab_size):
+  def do_make_caption(self, img, src_lookup, src_token_to_id, src_id_to_token, W_y, b_y, max_len, show_attention, src_vocab_size, make_embeds):
     W1_att_img = dy.parameter(self.W1_att_img) # attention_size * image_size
     img_vec = dy.inputTensor(img) #image_points * image_size
     h_fs_matrix = dy.transpose(img_vec)
@@ -304,7 +329,7 @@ class Attention:
     w1 = W1_att_img * h_fs_matrix
     cw = trans_sentence[0]
     c_t = dy.vecInput(self.image_size)
-    start = dy.concatenate([dy.lookup(src_lookup, src_token_to_id['<S>']), c_t])
+    start = dy.concatenate([self.lookup(src_lookup, src_token_to_id['<S>']), c_t])
     dec_state = self.dec_builder.initial_state().add_input(start)
     att = []
     embeds = []
@@ -316,7 +341,7 @@ class Attention:
         if show_attention:
           att.append(a_t.value().tolist())
 
-        embed_t = dy.lookup(src_lookup, src_token_to_id[cw])
+        embed_t = self.lookup(src_lookup, src_token_to_id[cw])
         x_t = dy.concatenate([embed_t, c_t])
         
         dec_state = dec_state.add_input(x_t)
@@ -327,21 +352,24 @@ class Attention:
         p_val[0] *= self.unk_penalty
         amax = np.argmax(p_val)
 
-        if self.multilangmode == ENCDECPIPELINE or self.multilangmode == ATTPIPELINE:
-          if self.pipeline_candidates > 1:
-            avg_embed = None
-            for i in xrange(self.pipeline_candidates):
-              i = random.randint(0, src_vocab_size - 1)
-              embed = dy.lookup(src_lookup, i) * dy.pick(p, i)
-              if avg_embed is None:
-                avg_embed = embed
-              else:
-                avg_embed += embed
-            embeds.append(avg_embed)
-          else:
-            embeds.append(dy.lookup(src_lookup, amax) * dy.pick(p, amax))
-        elif self.multilangmode == MRT:
-          embeds.append(dy.lookup(src_lookup, amax))
+        if make_embeds:
+          if self.multilangmode == ENCDECPIPELINE or self.multilangmode == ATTPIPELINE:
+            if self.sample_embeds == "average":
+              embeds.append(dy.transpose(src_lookup) * p)
+            elif self.pipeline_candidates > 1:
+              avg_embed = None
+              for i in xrange(self.pipeline_candidates):
+                i = random.randint(0, src_vocab_size - 1)
+                embed = self.lookup(src_lookup, i) * dy.pick(p, i)
+                if avg_embed is None:
+                  avg_embed = embed
+                else:
+                  avg_embed += embed
+              embeds.append(avg_embed)
+            else:
+              embeds.append(dy.lookup(src_lookup, amax) * dy.pick(p, amax))
+          elif self.multilangmode == MRT:
+            embeds.append(dy.lookup(src_lookup, amax))
 
         # Find the word corresponding to the best id
         cw = src_id_to_token[amax]
@@ -361,7 +389,7 @@ class Attention:
     if is_src:
       W_y = dy.parameter(self.W_y)
       b_y = dy.parameter(self.b_y)
-      sent, att, emb = self.do_make_beam_caption(img, self.src_lookup, self.src_token_to_id,  self.src_id_to_token, self.src_vocab_size, W_y, b_y, max_len, show_attention, beam_size, show_candidates)
+      sent, att, emb = self.do_make_beam_caption(img, self.get_src_lookup(), self.src_token_to_id,  self.src_id_to_token, self.src_vocab_size, W_y, b_y, max_len, show_attention, beam_size, show_candidates)
       return sent, att
     elif self.multilangmode == FORK:
       W_tgt = dy.parameter(self.W_tgt)
@@ -373,7 +401,7 @@ class Attention:
         return "beam search not supported for target language", []
       W_y = dy.parameter(self.W_y)
       b_y = dy.parameter(self.b_y)
-      sent, att, emb = self.do_make_beam_caption(img, self.src_lookup, self.src_token_to_id,  self.src_id_to_token, self.src_vocab_size, W_y, b_y, max_len, show_attention, beam_size, show_candidates)
+      sent, att, emb = self.do_make_beam_caption(img, self.get_src_lookup(), self.src_token_to_id,  self.src_id_to_token, self.src_vocab_size, W_y, b_y, max_len, show_attention, beam_size, show_candidates, make_embeds = True)
       W_tgt = dy.parameter(self.W_tgt)
       b_tgt = dy.parameter(self.b_tgt)
 
@@ -386,7 +414,7 @@ class Attention:
         w2_patt = dy.parameter(self.w2_patt)
         return self.make_att_caption(emb, self.tgt_lookup, self.tgt_token_to_id, self.tgt_id_to_token, self.tgt_vocab_size, W_tgt, b_tgt, W1_patt_src, W1_patt_tgt, w2_patt, self.tgt_dec_builder, max_len, show_attention)
     elif self.multilangmode == DUALATT:
-      avg_embeds = compute_embed_simple(src_sent, self.src_lookup, self.src_token_to_id)
+      avg_embeds = compute_embed_simple(src_sent, self.get_src_lookup(), self.src_token_to_id)
       
 
   def make_encdec_caption(self, avg_embeds, tgt_lookup, tgt_token_to_id, tgt_id_to_token, tgt_vocab_size, W_tgt, b_tgt, tgt_enc_builder, tgt_dec_builder, max_len):
@@ -664,7 +692,7 @@ class Attention:
     c_t = dy.vecInput(self.image_size)
     start_tokens = ["<S>"] * num_batches
     start_ids = [src_token_to_id[st] for st in start_tokens] 
-    start = dy.concatenate([dy.lookup_batch(src_lookup, start_ids), c_t]) 
+    start = dy.concatenate([self.lookup_batch(src_lookup, start_ids), c_t]) 
     dec_state = self.dec_builder.initial_state().add_input(start)
     w1 = W1_att_img * h_fs_matrix
     avg_embeds = list()
@@ -676,7 +704,7 @@ class Attention:
         h_e = dec_state.output()
         c_t, a_t = self.__attention_mlp(h_fs_matrix, h_e, w1, W1_att_src, w2_att)
         cwids = [src_token_to_id[cw] for cw in cws] 
-        embed_t = dy.lookup_batch(src_lookup, cwids)
+        embed_t = self.lookup_batch(src_lookup, cwids)
 
 
         x_t = dy.concatenate([embed_t, c_t])
@@ -686,24 +714,29 @@ class Attention:
 
         if self.multilangmode == ENCDECPIPELINE or self.multilangmode == ATTPIPELINE:
           p = dy.softmax(y_star) #p is src_vocab_size * 1
-          p_val_batch = p.npvalue()
-          #print(p_val_batch.shape)
-          q = p_val_batch.shape
-          embed_avg = None
-          for i in xrange(self.pipeline_candidates):  
-            if len(q) == 1: # batch size of one messes up dimensionality
-              amaxs = [self.sampler(p_val_batch)]
-            else:
-              amaxs = []
-              for p_val in p_val_batch.T:
-                amax = self.sampler(p_val)
-                amaxs.append(amax)
-            embeds = dy.lookup_batch(src_lookup, amaxs) # embeds is embed_size * 1
-            pick_p = dy.pick_batch(p, amaxs) # 1x1
-            if embed_avg is None:
-              embed_avg = embeds*pick_p
-            else:
-              embed_avg += embeds * pick_p
+          if self.sample_embeds == "average":
+            # src_lookup is src_vocab_size * embed_size
+            embed_avg = dy.transpose(src_lookup) * p
+          else:
+            embed_avg = None
+            p_val_batch = p.npvalue()
+            #print(p_val_batch.shape)
+            q = p_val_batch.shape
+
+            for i in xrange(self.pipeline_candidates):  
+              if len(q) == 1: # batch size of one messes up dimensionality
+                amaxs = [self.sampler(p_val_batch)]
+              else:
+                amaxs = []
+                for p_val in p_val_batch.T:
+                  amax = self.sampler(p_val)
+                  amaxs.append(amax)
+              embeds = dy.lookup_batch(src_lookup, amaxs) # embeds is embed_size * 1
+              pick_p = dy.pick_batch(p, amaxs) # 1x1
+              if embed_avg is None:
+                embed_avg = embeds*pick_p
+              else:
+                embed_avg += embeds * pick_p
           avg_embeds.append(embed_avg)
         elif self.multilangmode == MRT or self.multilangmode == DUALATT:
           p = dy.softmax(y_star) #p is src_vocab_size * 1
@@ -748,7 +781,7 @@ class Attention:
     src_batch = [["<S>"]+x[1][cnum]+["</S>"] for x in batch]
     tgt_batch = [["<S>"]+x[2][cnum2]+["</S>"] for x in batch]
 
-    losses, total_words, avg_embeds, prob = self.compute_losses(batch, src_batch, self.src_lookup, self.src_token_to_id, W_y, b_y)
+    losses, total_words, avg_embeds, prob = self.compute_losses(batch, src_batch, self.get_src_lookup(), self.src_token_to_id, W_y, b_y)
     sum1 = dy.sum_batches(dy.esum(losses))
 
     if self.multilang:
