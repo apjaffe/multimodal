@@ -11,3 +11,12 @@ splits/
 *.mdl
 *.mdl.pyk
 *.mdl.pym
+std_full/
+out_full/
+cites/
+mmt16_task2_test/
+cudnn-8.0-linux-x64-v6.0.tgz
+*.tar
+*.tgz
+attention/
+*.rej
