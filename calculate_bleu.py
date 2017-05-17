@@ -24,7 +24,7 @@ def main():
       pval = bootstrap(args.refs, args.baseline, hyp, int(args.samples))
     meteor = -1.0
     if args.meteor_refs is not None and bleu1 > 0:
-      raw2 = subprocess.check_output(["java","-Xmx2G","-jar", "/mnt/home/ubuntu/meteor-1.5/meteor-1.5.jar",hyp,"refs/valid.de","-l", "de", "-norm", "-r", "5"],stderr=DEVNULL)
+      raw2 = subprocess.check_output(["java","-Xmx2G","-jar", "/mnt/home/ubuntu/meteor-1.5/meteor-1.5.jar",hyp,args.meteor_refs,"-l", "de", "-norm", "-r", "5"],stderr=DEVNULL)
       meteor = get_meteor(raw2)
     print("%s\t%f\t%f\t%f" % (hyp, bleu1,pval,meteor))
     
