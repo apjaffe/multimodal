@@ -1,6 +1,5 @@
 flickr30k-images/
 images_flickr.task2/
-output/
 mmt_task2/
 splits/
 *.npy
