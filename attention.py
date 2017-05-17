@@ -179,6 +179,12 @@ class Attention:
       c_t = h_fs_matrix * alignment
       return c_t, alignment # image_size x 1, image_points x 1
   
+  def len_penalty(self, ln):
+    if len >= 10:
+      return 0.0
+    else:
+      return math.log(ln/10)
+
   def do_make_beam_caption(self, img, src_lookup, src_token_to_id, src_id_to_token, src_vocab_size, W_y, b_y, max_len, show_attention, beam_size, show_candidates, make_embeds = False):
     if beam_size == 1:
       return self.do_make_caption(img, src_lookup, src_token_to_id, src_id_to_token, W_y, b_y, max_len, show_attention, src_vocab_size, make_embeds)
@@ -205,7 +211,7 @@ class Attention:
       for (trans_sentence, dec_state, prob) in candidates:
         cw = trans_sentence[-1]
         if cw == '</S>':
-          next_candidates.append((trans_sentence, dec_state, prob))
+          next_candidates.append((trans_sentence, dec_state, prob + self.len_penalty(len(trans_sentence))))
           continue
 
         h_e = dec_state.output()
@@ -343,7 +349,7 @@ class Attention:
           att.append(a_t.value().tolist())
 
         embed_t = self.lookup(src_lookup, src_token_to_id[cw])
-        x_t = dy.concatenate([embed_t, c_t, c_ti])
+        x_t = dy.concatenate([embed_t, c_t])
         
         dec_state = dec_state.add_input(x_t)
         #print(W_y.npvalue().shape, dec_state.output().npvalue().shape, b_y.npvalue().shape)
@@ -385,7 +391,7 @@ class Attention:
     sent = ' '.join(trans_sentence[1:])
     return sent, att, embeds
 
-  def make_caption(self, img, max_len = 30, show_attention = False, is_src = True, beam_size = 1, show_candidates = False, src_sent = None):
+  def make_caption(self, img, max_len = 30, show_attention = False, is_src = True, beam_size = 1, show_candidates = False, src_sent = None, use_src_sent = False):
     dy.renew_cg()
 
     if is_src:
@@ -401,11 +407,17 @@ class Attention:
     elif self.multilangmode == ENCDECPIPELINE or self.multilangmode == ATTPIPELINE or self.multilangmode == MRT or self.multilangmode == ENCDECPIPELINE2: # beam size must be 1
       if beam_size > 1:
         return "beam search not supported for target language", []
-      W_y = dy.parameter(self.W_y)
-      b_y = dy.parameter(self.b_y)
-      sent, att, emb = self.do_make_beam_caption(img, self.get_src_lookup(), self.src_token_to_id,  self.src_id_to_token, self.src_vocab_size, W_y, b_y, max_len, show_attention, beam_size, show_candidates, make_embeds = True)
+      
+      if use_src_sent:
+        emb = self.compute_embed_simple(src_sent, self.get_src_lookup(), self.src_token_to_id)
+      else:
+        W_y = dy.parameter(self.W_y)
+        b_y = dy.parameter(self.b_y)
+        sent, att, emb = self.do_make_beam_caption(img, self.get_src_lookup(), self.src_token_to_id,  self.src_id_to_token, self.src_vocab_size, W_y, b_y, max_len, show_attention, beam_size, show_candidates, make_embeds = True)
+      
       W_tgt = dy.parameter(self.W_tgt)
       b_tgt = dy.parameter(self.b_tgt)
+      
 
       if self.multilangmode == ENCDECPIPELINE or self.multilangmode == ENCDECPIPELINE2:
         sent_tgt = self.make_encdec_caption(emb, self.tgt_lookup, self.tgt_token_to_id, self.tgt_id_to_token, self.tgt_vocab_size, W_tgt, b_tgt, self.tgt_enc_builder, self.tgt_dec_builder, max_len)
@@ -524,7 +536,7 @@ class Attention:
   def compute_embed_simple(self, sentence, src_lookup, src_token_to_id):
     embeds = list()
     for word in sentence.split(" "):
-      embeds.append(dy.lookup(src_lookup, src_token_to_id[word]))
+      embeds.append(self.lookup(src_lookup, src_token_to_id[word]))
     return embeds
 
   def compute_embeds(self, src_batch, src_lookup, src_token_to_id):
@@ -532,7 +544,7 @@ class Attention:
     embeds = list()
     for cws in src_cws:
       cwids = [src_token_to_id[cw] for cw in cws] 
-      embed_t = dy.lookup_batch(src_lookup, cwids)
+      embed_t = self.lookup_batch(src_lookup, cwids)
       embeds.append(embed_t)
     return embeds
 
@@ -787,14 +799,14 @@ class Attention:
     tgt_batch = [["<S>"]+x[2][cnum2]+["</S>"] for x in batch]
 
     make_embeds = True
-    if self.multilangmode == DUALATT:
+    if self.multilangmode == DUALATT or self.multilangmode == ATTPIPELINE:
       make_embeds = (random.randint(1,self.fake_ratio) == 1)
 
     losses, total_words, avg_embeds, prob = self.compute_losses(batch, src_batch, self.get_src_lookup(), self.src_token_to_id, W_y, b_y, make_embeds)
     sum1 = dy.sum_batches(dy.esum(losses))
 
     if not make_embeds:
-      avg_embeds = self.compute_embeds(src_batch, self.src_lookup, self.src_token_to_id)
+      avg_embeds = self.compute_embeds(src_batch, self.get_src_lookup(), self.src_token_to_id)
 
     if self.multilang:
       W_tgt = dy.parameter(self.W_tgt)
@@ -842,7 +854,7 @@ def dev_perplexity(dev_batches, encdec, num_captions):
           lv = loss.value()
           dev_loss += lv
           dev_words += words
-        if tidx >= 3:
+        if tidx >= 6:
           print("Dev cnum %d" % cnum)
           break
 
@@ -996,6 +1008,9 @@ def main():
             print(encdec.make_caption(valid_imgs[0], is_src = False, src_sent = sent1)[0])
             print(encdec.make_caption(valid_imgs[1], is_src = False, src_sent = sent2)[0])
             print(encdec.make_caption(valid_imgs[4], is_src = False, src_sent = sent3)[0])
+            print(encdec.make_caption(valid_imgs[0], is_src = False, src_sent = "a group of people stand in the back of a truck filled with cotton", use_src_sent = True)[0])
+            print(encdec.make_caption(valid_imgs[1], is_src = False, src_sent = "an adult wearing a gray shirt with red sleeves sleeping on a couch", use_src_sent = True)[0])
+            print(encdec.make_caption(valid_imgs[4], is_src = False, src_sent = "a man in a green shirt and red life jacket is sitting in a canoe drifting around the lake", use_src_sent = True)[0])
           print("Batch %d with loss %f" % (tidx, partial_loss / partial_words))
           partial_loss = 0
           partial_words = 0

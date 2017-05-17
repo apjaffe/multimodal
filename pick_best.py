@@ -1,21 +1,11 @@
 import subprocess
 import argparse
+from bleu_util import get_bleu, read_file
 
 DEVNULL = open("/dev/null","w")
 
 # perform sequence-level interpolation from http://aclweb.org/anthology/D/D16/D16-1139.pdf
 
-def read_file(fname):
-    with open(fname) as f:
-      lines = f.read().split("\n")
-      if len(lines[-1]) <= 1: # blank last line
-        return lines[:-1]
-      else:
-        return lines
-
-
-def get_bleu(raw):
-  return float(raw.split(",")[0].split(" = ")[1])
 
 def compute_bleu(sent, refs):
   for i, ref in enumerate(refs):
